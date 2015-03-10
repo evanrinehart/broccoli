@@ -3,8 +3,8 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
 module Control.Broccoli (
-  X(..),
-  E(..),
+  X,
+  E,
   Output(..),
   runProgram,
   edge,
