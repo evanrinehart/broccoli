@@ -3,7 +3,7 @@
 
 name:                broccoli
 version:             0.1.0.0
--- synopsis:            
+synopsis:            Small library for interactive functional programs.
 -- description:         
 license:             BSD3
 license-file:        LICENSE
