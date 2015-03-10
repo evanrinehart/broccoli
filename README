@@ -1,0 +1,19 @@
+fmap       :: (a -> b) -> X a -> X b
+fmap       :: (a -> b) -> E a -> E b
+pure       :: a -> X a
+<*>        :: X (a -> b) -> X a -> X b
+never      :: E a
+<>         :: E a -> E a -> E a
+edge       :: X a -> (a -> a -> Maybe b) -> E b
+accumulate :: E a -> s -> (a -> s -> s) -> X s
+snapshot   :: E a -> X b -> E (a, b)
+snapshot_  :: E a -> X b -> E b
+filterE    :: (a -> Bool) -> E a -> E a
+justE      :: E (Maybe a) -> E a
+maybeE     :: (a -> Maybe b) -> E a -> E b
+out        :: E a -> (a -> IO ()) -> Output
+newX       :: a -> IO (a -> IO (), X a)
+newE       :: IO (a -> IO (), E a)
+runProgram :: IO () -> E () -> [Output] -> IO ()   
+debugX     :: (Eq a, Show a) => X a -> Output
+debugE     :: Show a => E a -> Output

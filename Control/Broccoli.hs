@@ -15,6 +15,7 @@ module Control.Broccoli (
   filterE,
   justE,
   maybeE,
+  never,
   debugX,
   debugE,
   newX,
@@ -173,6 +174,10 @@ maybeE f e = justE (f <$> e)
 -- | Filter out events using a Bool function.
 filterE :: (a -> Bool) -> E a -> E a
 filterE p e = maybeE (\x -> if p x then Just x else Nothing) e
+
+-- | An event that never happens.
+never :: E a
+never = mempty
 
 -- | Events will occur when an "edge" is detected in a signal. The detection
 -- algorithm checks the two values before and after a discrete change in
