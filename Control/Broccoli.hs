@@ -20,14 +20,14 @@ module Control.Broccoli (
   input,
   output,
   debugX,
-  debugE
+  debugE,
+  (<||>)
 ) where
 
 import Control.Applicative
 import Data.Functor
 import Data.Monoid
 import Control.Monad
-import Data.Unamb
 import Data.IORef
 import Control.Concurrent
 import Control.Concurrent.STM
@@ -130,24 +130,53 @@ dupE e = case e of
     ch' <- atomically (dupTChan ch)
     return (PortE mv ch')
 
-readE :: E a -> IO a
+data Promise a = Promise { force :: IO a }
+
+instance Functor Promise where
+  fmap f p = f <$> Promise (force p)
+
+instance Applicative Promise where
+  pure x = Promise (return x)
+  ff <*> xx = Promise $ do
+    f <- force ff
+    x <- force xx
+    return (f x)
+
+readE :: E a -> STM (Maybe a)
 readE e = case e of
-  NeverE -> hang
-  MappendE e1 e2 -> race (readE e1) (readE e2)
-  FmapE f e' -> f <$> readE e'
+  NeverE -> return Nothing
+  MappendE e1 e2 -> do
+    mx <- readE e1
+    case mx of
+      Nothing -> do
+        my <- readE e2
+        case my of
+          Nothing -> return Nothing
+          Just y -> return (Just y)
+      Just x -> return (Just x)
+  FmapE f e' -> (fmap . fmap) f (readE e')
   ProductE f e1 e2 -> do
-    x <- readE e1
-    y <- readE e2
-    return (f x y)
+    mx <- readE e1
+    my <- readE e2
+    case (mx,my) of
+      (Just x, Just y) -> return (Just (f x y))
+      _ -> return Nothing
   SnapshotE e' x -> do
-    readE e'
-    atomically (readX x)
-  JustE e' -> fix $ \loop -> do
-    m <- readE e'
-    case m of
-      Nothing -> loop
-      Just x  -> return x
-  PortE _ ch -> atomically (readTChan ch)
+    m_ <- readE e'
+    case m_ of
+      Nothing -> return Nothing
+      Just _ -> Just <$> readX x
+  JustE e' -> do
+    mx <- readE e'
+    case mx of
+      Nothing -> return Nothing
+      Just Nothing  -> return Nothing
+      Just (Just x) -> return (Just x)
+  PortE _ ch -> do
+    emp <- isEmptyTChan ch
+    if emp
+      then return Nothing
+      else Just <$> readTChan ch
 
 readX :: X a -> STM a
 readX x = case x of
@@ -167,7 +196,14 @@ hang = do
 waitE :: E a -> IO a
 waitE e0 = do
   e <- dupE e0
-  readE e
+  readEIO e
+
+readEIO :: E a -> IO a
+readEIO e = atomically $ do
+  mx <- readE e
+  case mx of
+    Nothing -> retry
+    Just x -> return x
 
 ---
 
@@ -205,11 +241,14 @@ accumulate e0 s0 trans = case getThreadsE e0 of
       threadId <- forkIO $ do
         e <- dupE e0
         forever $ do
-          x <- readE e
           atomically $ do
-            s <- readTVar state
-            let s' = trans x s
-            writeTVar state s'
+            mx <- readE e
+            case mx of
+              Nothing -> retry
+              Just x -> do
+                s <- readTVar state
+                let s' = trans x s
+                writeTVar state s'
       modifyMVar_ mv (return . (threadId:))
       return state
 
@@ -243,7 +282,9 @@ newE :: Setup (E a, a -> IO ())
 newE = do
   mv <- getThreads
   bch <- setupIO newBroadcastTChanIO
-  return (PortE mv bch, atomically . writeTChan bch)
+  return (PortE mv bch, \x -> do
+    (atomically . writeTChan bch) x
+    )
 
 -- | Creates a new signal and an IO action to update it. The argument is
 -- the initial value of the signal.
@@ -259,7 +300,7 @@ output e0 act = do
   mv <- getThreads
   setupIO $ do
     e <- dupE e0
-    tid <- (forkIO . forever) (readE e >>= act)
+    tid <- (forkIO . forever) (readEIO e >>= act)
     modifyMVar_ mv (return . (tid:))
     return ()
 
@@ -290,7 +331,7 @@ runProgram (Setup setup) = do
 debugE :: Show a => E a -> E a
 debugE e = unsafePerformIO $ do
   e' <- dupE e
-  (forkIO . forever) (readE e' >>= print)
+  (forkIO . forever) (readEIO e' >>= print)
   return e
 
 -- | Print out transitions in a signal. Only for debugging purposes.
@@ -301,5 +342,10 @@ debugX x =
   unsafePerformIO $ do
     forkIO $ do
       e' <- dupE e
-      forever (readE e' >>= print)
+      forever (readEIO e' >>= print)
     return x
+
+-- | Same as <> but on events that might have a different type.
+(<||>) :: E a -> E b -> E (Either a b)
+e1 <||> e2 = (Left <$> e1) <> (Right <$> e2)
+
