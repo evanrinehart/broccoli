@@ -10,15 +10,17 @@ module Control.Broccoli (
   snapshot_,
   accumulate,
   edge,
-  filterE,
   justE,
   maybeE,
+  filterE,
   Setup,
   runProgram,
   newX,
   newE,
   input,
   output,
+  debugX,
+  debugE
 ) where
 
 import Control.Applicative
@@ -245,7 +247,8 @@ newE = do
   bch <- setupIO newBroadcastTChanIO
   return (PortE mv bch, atomically . writeTChan bch)
 
--- | Creates a new signal and an IO action to update it.
+-- | Creates a new signal and an IO action to update it. The argument is
+-- the initial value of the signal.
 newX :: a -> Setup (X a, a -> IO ())
 newX v = do
   mv <- getThreads
@@ -279,8 +282,27 @@ runProgram :: Setup (IO (), E ()) -> IO ()
 runProgram (Setup setup) = do
   mv <- newMVar []
   (boot, exit) <- setup mv
-  threadDelay 5000
+  --threadDelay 5000
   boot
   waitE exit
   withMVar mv (mapM killThread)
   return ()
+
+-- | Print out events as they occur. Only for debugging purposes.
+debugE :: Show a => E a -> E a
+debugE e = unsafePerformIO $ do
+  e' <- dupE e
+  (forkIO . forever) (readE e' >>= print)
+  return e
+
+-- | Print out transitions in a signal. Only for debugging purposes.
+debugX :: (Eq a, Show a) => X a -> X a
+debugX x =
+  let diff a b = if a == b then Nothing else Just (a,b) in
+  let e = edge x diff in
+  unsafePerformIO $ do
+    forkIO $ do
+      putStrLn "edge forked"
+      e' <- dupE e
+      forever (readE e' >>= print)
+    return x
