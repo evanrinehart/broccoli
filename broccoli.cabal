@@ -2,7 +2,7 @@
 -- documentation, see http://haskell.org/cabal/users-guide/
 
 name:                broccoli
-version:             0.2.0.0
+version:             0.2.0.1
 synopsis:            Small library for interactive functional programs.
 description:         Small library for interactive functional programs.
 license:             BSD3
@@ -32,4 +32,4 @@ source-repository head
 source-repository this
   type: git
   location: https://github.com/evanrinehart/broccoli
-  tag: 0.2.0.0
+  tag: 0.2.0.1

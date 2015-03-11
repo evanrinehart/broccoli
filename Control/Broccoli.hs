@@ -203,7 +203,6 @@ accumulate e0 s0 trans = case getThreadsE e0 of
     tv = unsafePerformIO $ do
       state <- newTVarIO s0
       threadId <- forkIO $ do
-        putStrLn "accum forked"
         e <- dupE e0
         forever $ do
           x <- readE e
@@ -224,7 +223,6 @@ edge x diff = case getThreadsX x of
     ch = unsafePerformIO $ do
       out <- newBroadcastTChanIO
       threadId <- forkIO $ do
-        putStrLn "edge forked"
         v0 <- atomically (readX x)
         ref <- newIORef v0
         forever $ do
@@ -302,7 +300,6 @@ debugX x =
   let e = edge x diff in
   unsafePerformIO $ do
     forkIO $ do
-      putStrLn "edge forked"
       e' <- dupE e
       forever (readE e' >>= print)
     return x
