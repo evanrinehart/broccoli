@@ -21,17 +21,15 @@ module Control.Broccoli (
   output,
   debugX,
   debugE,
-  (<||>)
+  (-|-)
 ) where
 
 import Control.Applicative
-import Data.Functor
 import Data.Monoid
 import Control.Monad
 import Data.IORef
 import Control.Concurrent
 import Control.Concurrent.STM
-import Data.Function
 import System.IO.Unsafe
 
 -- | A value of type a that varies.
@@ -46,9 +44,9 @@ data E a where
   NeverE    :: E a
   FmapE     :: forall a b . (b -> a) -> E b -> E a
   MappendE  :: E a -> E a -> E a
-  ProductE  :: (b -> c -> a) -> E b -> E c -> E a
-  SnapshotE :: E b -> X a -> E a
+  SnapshotE :: a ~ (b,c) => E b -> X c -> E a
   JustE     :: E (Maybe a) -> E a
+  --DelayedE  :: E a -> Int -> E a
   PortE     :: MVar [ThreadId] -> TChan a -> E a
 
 instance Functor X where
@@ -94,7 +92,6 @@ getThreadsE e = case e of
   NeverE -> Nothing
   FmapE _ e' -> getThreadsE e'
   MappendE e1 e2 -> getFirst $ First (getThreadsE e1) <> First (getThreadsE e2)
-  ProductE _ e1 e2 -> getFirst $ First (getThreadsE e1) <> First (getThreadsE e2)
   SnapshotE e' x -> getFirst $ First (getThreadsE e') <> First (getThreadsX x)
   JustE e' -> getThreadsE e'
   PortE mv _ -> Just mv
@@ -116,10 +113,6 @@ dupE e = case e of
     e1' <- dupE e1
     e2' <- dupE e2
     return (MappendE e1' e2')
-  ProductE f e1 e2 -> do
-    e1' <- dupE e1
-    e2' <- dupE e2
-    return (ProductE f e1' e2')
   SnapshotE e' x -> do
     e'' <- dupE e'
     return (SnapshotE e'' x)
@@ -142,44 +135,54 @@ instance Applicative Promise where
     x <- force xx
     return (f x)
 
-readE :: E a -> STM (Maybe a)
+data EventResult a =
+  TryLater |
+  DropThis |
+  NotNowNotEver |
+  --Delayed a Int |
+  Normal a
+    deriving Show
+
+readE :: E a -> STM (EventResult a)
 readE e = case e of
-  NeverE -> return Nothing
+  NeverE -> return TryLater
   MappendE e1 e2 -> do
     mx <- readE e1
     case mx of
-      Nothing -> do
-        my <- readE e2
-        case my of
-          Nothing -> return Nothing
-          Just y -> return (Just y)
-      Just x -> return (Just x)
-  FmapE f e' -> (fmap . fmap) f (readE e')
-  ProductE f e1 e2 -> do
-    mx <- readE e1
-    my <- readE e2
-    case (mx,my) of
-      (Just x, Just y) -> return (Just (f x y))
-      _ -> return Nothing
+      TryLater -> readE e2
+      ok -> return ok
+  FmapE f e' -> do
+    mx <- readE e'
+    case mx of
+      Normal x -> (return . Normal . f) x
+      TryLater -> return TryLater
+      DropThis -> return DropThis
+      NotNowNotEver -> return NotNowNotEver
   SnapshotE e' x -> do
-    m_ <- readE e'
-    case m_ of
-      Nothing -> return Nothing
-      Just _ -> Just <$> readX x
+    ma <- readE e'
+    case ma of
+      Normal a -> do
+        b <- readX x
+        return (Normal (a,b))
+      TryLater -> return TryLater
+      DropThis -> return DropThis
+      NotNowNotEver -> return NotNowNotEver
   JustE e' -> do
     mx <- readE e'
     case mx of
-      Nothing -> return Nothing
-      Just Nothing  -> return Nothing
-      Just (Just x) -> return (Just x)
+      Normal Nothing -> return DropThis
+      Normal (Just x) -> return (Normal x)
+      TryLater -> return TryLater
+      DropThis -> return DropThis
+      NotNowNotEver -> return NotNowNotEver
   PortE _ ch -> do
     emp <- isEmptyTChan ch
     if emp
-      then return Nothing
-      else Just <$> readTChan ch
+      then return TryLater
+      else Normal <$> readTChan ch
 
 readX :: X a -> STM a
-readX x = case x of
+readX sig = case sig of
   PureX v -> return v
   FmapX f xx -> f <$> readX xx
   ApplX ff xx -> do
@@ -188,32 +191,37 @@ readX x = case x of
     return (f x)
   PortX _ tv -> readTVar tv
 
-hang :: IO a
-hang = do
-  threadDelay (100 * 10^(6::Int))
-  hang
-
 waitE :: E a -> IO a
 waitE e0 = do
   e <- dupE e0
   readEIO e
 
 readEIO :: E a -> IO a
-readEIO e = atomically $ do
-  mx <- readE e
-  case mx of
-    Nothing -> retry
-    Just x -> return x
+readEIO e = do
+  result <- atomically $ do
+    mx <- readE e
+    case mx of
+      TryLater -> retry
+      other -> return other
+  case result of
+    TryLater -> error "impossible"
+    Normal a -> return a
+    DropThis -> readEIO e
+    NotNowNotEver -> hang
 
+hang :: IO a
+hang = do
+  threadDelay (100 * 10^(6::Int))
+  hang
 ---
 
 -- | An event which gets the value of a signal when another event occurs.
 snapshot :: E a -> X b -> E (a,b)
-snapshot e x = ProductE (,) e (SnapshotE e x)
+snapshot e x = SnapshotE e x
 
 -- | Like snapshot but ignores the original event's payload.
 snapshot_ :: E a -> X b -> E b
-snapshot_ e x = SnapshotE e x
+snapshot_ e x = snd <$> snapshot e x
 
 -- | Filter out events with the value of Nothing.
 justE :: E (Maybe a) -> E a
@@ -244,11 +252,13 @@ accumulate e0 s0 trans = case getThreadsE e0 of
           atomically $ do
             mx <- readE e
             case mx of
-              Nothing -> retry
-              Just x -> do
+              TryLater -> retry
+              DropThis -> return ()
+              Normal x -> do
                 s <- readTVar state
                 let s' = trans x s
                 writeTVar state s'
+              NotNowNotEver -> error "impossible (2)"
       modifyMVar_ mv (return . (threadId:))
       return state
 
@@ -324,14 +334,14 @@ runProgram (Setup setup) = do
   --threadDelay 5000
   boot
   waitE exit
-  withMVar mv (mapM killThread)
+  _ <- withMVar mv (mapM killThread)
   return ()
 
 -- | Print out events as they occur. Only for debugging purposes.
 debugE :: Show a => E a -> E a
 debugE e = unsafePerformIO $ do
   e' <- dupE e
-  (forkIO . forever) (readEIO e' >>= print)
+  _ <- (forkIO . forever) (readEIO e' >>= print)
   return e
 
 -- | Print out transitions in a signal. Only for debugging purposes.
@@ -340,12 +350,11 @@ debugX x =
   let diff a b = if a == b then Nothing else Just (a,b) in
   let e = edge x diff in
   unsafePerformIO $ do
-    forkIO $ do
+    _ <- forkIO $ do
       e' <- dupE e
       forever (readEIO e' >>= print)
     return x
 
 -- | Same as <> but on events that might have a different type.
-(<||>) :: E a -> E b -> E (Either a b)
-e1 <||> e2 = (Left <$> e1) <> (Right <$> e2)
-
+(-|-) :: E a -> E b -> E (Either a b)
+e1 -|- e2 = (Left <$> e1) <> (Right <$> e2)
