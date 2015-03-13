@@ -5,6 +5,7 @@
 module Control.Broccoli (
   X,
   E,
+  Time,
   never,
   snapshot,
   snapshot_,
@@ -17,6 +18,7 @@ module Control.Broccoli (
   runProgram,
   newX,
   newE,
+  newTime,
   input,
   output,
   debugX,
@@ -31,12 +33,14 @@ import Data.IORef
 import Control.Concurrent
 import Control.Concurrent.STM
 import System.IO.Unsafe
+import Data.Time
 
 -- | A value of type a that varies.
 data X a where
   PureX :: a -> X a
   FmapX :: forall a b . (b -> a) -> X b -> X a
   ApplX :: forall a b . X (b -> a) -> X b -> X a
+  TimeX :: a ~ Time => MVar [ThreadId] -> X a
   PortX :: MVar [ThreadId] -> TVar a -> X a
 
 -- | An event that carries values of type a when it occurs.
@@ -47,7 +51,9 @@ data E a where
   SnapshotE :: a ~ (b,c) => E b -> X c -> E a
   JustE     :: E (Maybe a) -> E a
   --DelayedE  :: E a -> Int -> E a
-  PortE     :: MVar [ThreadId] -> TChan a -> E a
+  PortE     :: MVar [ThreadId] -> TChan (a, Time) -> E a
+
+type Time = Double
 
 instance Functor X where
   fmap f x = FmapX f x
@@ -101,6 +107,7 @@ getThreadsX x = case x of
   PureX _ -> Nothing
   FmapX _ x' -> getThreadsX x'
   ApplX x1 x2 -> getFirst $ First (getThreadsX x1) <> First (getThreadsX x2)
+  TimeX mv -> Just mv
   PortX mv _ -> Just mv
 
 dupE :: E a -> IO (E a)
@@ -140,12 +147,12 @@ data EventResult a =
   DropThis |
   NotNowNotEver |
   --Delayed a Int |
-  Normal a
+  Normal a Double
     deriving Show
 
 readE :: E a -> STM (EventResult a)
 readE e = case e of
-  NeverE -> return TryLater
+  NeverE -> return NotNowNotEver
   MappendE e1 e2 -> do
     mx <- readE e1
     case mx of
@@ -154,24 +161,24 @@ readE e = case e of
   FmapE f e' -> do
     mx <- readE e'
     case mx of
-      Normal x -> (return . Normal . f) x
+      Normal x t -> return (Normal (f x) t)
       TryLater -> return TryLater
       DropThis -> return DropThis
       NotNowNotEver -> return NotNowNotEver
   SnapshotE e' x -> do
     ma <- readE e'
     case ma of
-      Normal a -> do
-        b <- readX x
-        return (Normal (a,b))
+      Normal a t -> do
+        b <- readX t x
+        return (Normal (a,b) t)
       TryLater -> return TryLater
       DropThis -> return DropThis
       NotNowNotEver -> return NotNowNotEver
   JustE e' -> do
     mx <- readE e'
     case mx of
-      Normal Nothing -> return DropThis
-      Normal (Just x) -> return (Normal x)
+      Normal Nothing _ -> return DropThis
+      Normal (Just x) t -> return (Normal x t)
       TryLater -> return TryLater
       DropThis -> return DropThis
       NotNowNotEver -> return NotNowNotEver
@@ -179,16 +186,19 @@ readE e = case e of
     emp <- isEmptyTChan ch
     if emp
       then return TryLater
-      else Normal <$> readTChan ch
+      else do
+        (v, t) <- readTChan ch
+        return (Normal v t)
 
-readX :: X a -> STM a
-readX sig = case sig of
+readX :: Double -> X a -> STM a
+readX time sig = case sig of
   PureX v -> return v
-  FmapX f xx -> f <$> readX xx
+  FmapX f xx -> f <$> readX time xx
   ApplX ff xx -> do
-    f <- readX ff
-    x <- readX xx
+    f <- readX time ff
+    x <- readX time xx
     return (f x)
+  TimeX _ -> return time
   PortX _ tv -> readTVar tv
 
 waitE :: E a -> IO a
@@ -205,7 +215,7 @@ readEIO e = do
       other -> return other
   case result of
     TryLater -> error "impossible"
-    Normal a -> return a
+    Normal a _ -> return a
     DropThis -> readEIO e
     NotNowNotEver -> hang
 
@@ -254,7 +264,7 @@ accumulate e0 s0 trans = case getThreadsE e0 of
             case mx of
               TryLater -> retry
               DropThis -> return ()
-              Normal x -> do
+              Normal x _ -> do
                 s <- readTVar state
                 let s' = trans x s
                 writeTVar state s'
@@ -272,20 +282,29 @@ edge x diff = case getThreadsX x of
     ch = unsafePerformIO $ do
       out <- newBroadcastTChanIO
       threadId <- forkIO $ do
-        v0 <- atomically (readX x)
+        t0 <- chron
+        v0 <- atomically (readX t0 x)
         ref <- newIORef v0
         forever $ do
           v <- readIORef ref
+          now <- chron
           (d, v') <- atomically $ do
-            v' <- readX x
+            v' <- readX now x
             case diff v v' of
               Just d  -> return (d, v')
               Nothing -> retry
           writeIORef ref v'
-          atomically (writeTChan out d)
+          atomically (writeTChan out (d,now))
       modifyMVar_ mv (return . (threadId:))
       return out
 
+chron :: IO Double
+chron = do
+  let date = fromGregorian 2015 1 1
+  let epoch = localTimeToUTC utc (LocalTime date midnight)
+  now <- getCurrentTime
+  let time = diffUTCTime now epoch
+  return (realToFrac time)
 
 -- | Creates a new event and an IO action to trigger it.
 newE :: Setup (E a, a -> IO ())
@@ -293,7 +312,8 @@ newE = do
   mv <- getThreads
   bch <- setupIO newBroadcastTChanIO
   return (PortE mv bch, \x -> do
-    (atomically . writeTChan bch) x
+    now <- chron
+    (atomically . writeTChan bch) (x,now)
     )
 
 -- | Creates a new signal and an IO action to update it. The argument is
@@ -303,6 +323,13 @@ newX v = do
   mv <- getThreads
   tv <- setupIO (newTVarIO v)
   return (PortX mv tv, atomically . writeTVar tv)
+
+-- | Create a signal carrying the current time.
+newTime :: Setup (X Time)
+newTime = do
+  mv <- getThreads
+  return (TimeX mv)
+
 
 -- | Spawn a thread to execute an action for each event occurrence.
 output :: E a -> (a -> IO ()) -> Setup ()
