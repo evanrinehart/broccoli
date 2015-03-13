@@ -14,7 +14,7 @@ module Control.Broccoli (
   voidE,
   snapshot,
   snapshot_,
-  accumulate,
+  accum,
   edge,
   trap,
   justE,
@@ -296,8 +296,8 @@ voidE :: E a -> E ()
 voidE e = () <$ e
 
 -- | Sum over events using an initial state and a state transition function.
-accumulate :: E a -> s -> (a -> s -> s) -> X s
-accumulate e0 s0 trans = case getContextE e0 of
+accum :: E a -> s -> (a -> s -> s) -> X s
+accum e0 s0 trans = case getContextE e0 of
   Nothing -> pure s0
   Just cx -> PortX cx tv where
     tv = unsafePerformIO $ do
@@ -320,7 +320,7 @@ accumulate e0 s0 trans = case getContextE e0 of
 
 -- | A signal that remembers the most recent occurrence of an event.
 trap :: a -> E a -> X a
-trap x0 e = accumulate e x0 (\x _ -> x)
+trap x0 e = accum e x0 (\x _ -> x)
 
 -- | An event that occurs when an edge is detected in a signal. When a signal
 -- changes discretely the edge test is evaluated on the values immediately
@@ -362,18 +362,6 @@ chron epoch = do
   let time = diffUTCTime now epoch
   return (realToFrac time)
 
--- | Creates a new input event and a command to trigger it.
-newE :: Setup (E a, a -> IO ())
-newE = do
-  cx <- getContext
-  let epoch = cxEpoch cx
-  bch <- setupIO newBroadcastTChanIO
-  return
-    ( PortE cx bch
-    , \x -> do
-        now <- chron epoch
-        atomically (writeTChan bch (x,now)))
-
 newInternalBoot :: Context -> IO (E (), IO ())
 newInternalBoot cx = do
   bch <- newBroadcastTChanIO
@@ -393,6 +381,20 @@ newX v = do
     , \x -> do
         now <- chron epoch
         atomically (writeTVar tv (x,now)))
+
+-- | Creates a new input event and a command to trigger it.  Use 'input' to
+-- to provide external stimulus during the simulation.
+newE :: Setup (E a, a -> IO ())
+newE = do
+  cx <- getContext
+  let epoch = cxEpoch cx
+  bch <- setupIO newBroadcastTChanIO
+  return
+    ( PortE cx bch
+    , \x -> do
+        now <- chron epoch
+        atomically (writeTChan bch (x,now)))
+
 
 
 -- | Setup a thread to react to events. The callback will be provided with
