@@ -20,6 +20,7 @@ module Control.Broccoli (
   justE,
   maybeE,
   filterE,
+  rasterize,
 
   -- * Setup IO interface
   Setup,
@@ -52,6 +53,7 @@ data X a where
   PureX :: a -> X a
   FmapX :: forall a b . (b -> a) -> X b -> X a
   ApplX :: forall a b . X (b -> a) -> X b -> X a
+  MappendX :: Monoid a => X a -> X a -> X a
   TimeX :: a ~ Time => Context -> X a
   PortX :: Context -> TVar (a,Time) -> X a
 
@@ -73,6 +75,10 @@ instance Functor X where
 instance Applicative X where
   pure x = PureX x
   f <*> x = ApplX f x
+
+instance Monoid a => Monoid (X a) where
+  mempty = pure mempty
+  mappend = MappendX
 
 instance Functor E where
   fmap f e = FmapE f e
@@ -121,6 +127,7 @@ containsTimeX x = case x of
   PureX _ -> False
   FmapX _ x' -> containsTimeX x'
   ApplX x1 x2 -> containsTimeX x1 || containsTimeX x2
+  MappendX x1 x2 -> containsTimeX x1 || containsTimeX x2
   TimeX _ -> True
   PortX _ _ -> False
 
@@ -129,6 +136,7 @@ getContextX x = case x of
   PureX _ -> Nothing
   FmapX _ x' -> getContextX x'
   ApplX x1 x2 -> getFirst $ First (getContextX x1) <> First (getContextX x2)
+  MappendX x1 x2 -> getFirst $ First (getContextX x1) <> First (getContextX x2)
   TimeX cx -> Just cx
   PortX cx _ -> Just cx
 
@@ -231,6 +239,10 @@ readX time sig = case sig of
     (f,t1) <- readX time ff
     (x,t2) <- readX time xx
     return (f x, max t1 t2)
+  MappendX xx1 xx2 -> do
+    (x1, t1) <- readX time xx1
+    (x2, t2) <- readX time xx2
+    return (x1 <> x2, max t1 t2)
   TimeX _ -> return (time, time)
   PortX _ tv -> readTVar tv
 
@@ -296,8 +308,8 @@ voidE :: E a -> E ()
 voidE e = () <$ e
 
 -- | Sum over events using an initial state and a state transition function.
-accum :: E a -> s -> (a -> s -> s) -> X s
-accum e0 s0 trans = case getContextE e0 of
+accum :: s -> (a -> s -> s) -> E a -> X s
+accum s0 trans e0 = case getContextE e0 of
   Nothing -> pure s0
   Just cx -> PortX cx tv where
     tv = unsafePerformIO $ do
@@ -320,13 +332,13 @@ accum e0 s0 trans = case getContextE e0 of
 
 -- | A signal that remembers the most recent occurrence of an event.
 trap :: a -> E a -> X a
-trap x0 e = accum e x0 (\x _ -> x)
+trap x0 = accum x0 (\x _ -> x)
 
 -- | An event that occurs when an edge is detected in a signal. When a signal
 -- changes discretely the edge test is evaluated on the values immediately
 -- before and after a change. 
-edge :: X a -> (a -> a -> Maybe b) -> E b
-edge x diff = case getContextX x of
+edge :: (a -> a -> Maybe b) -> X a -> E b
+edge diff x = case getContextX x of
   Nothing -> never
   Just cx -> PortE cx ch where
     ch = unsafePerformIO $ do
@@ -335,6 +347,8 @@ edge x diff = case getContextX x of
         (v0,_) <- atomically (readX 0 x)
         ref <- newIORef v0
         if containsTimeX x
+          then error "edge can't grok a continuously changing signal"
+{-
           then forever $ do
             now <- chron (cxEpoch cx)
             v <- readIORef ref
@@ -344,6 +358,7 @@ edge x diff = case getContextX x of
                 writeIORef ref v'
                 atomically (writeTChan out (d,now))
               Nothing -> return ()
+-}
           else forever $ do
             v <- readIORef ref
             (d, v', t) <- atomically $ do
@@ -354,6 +369,27 @@ edge x diff = case getContextX x of
             writeIORef ref v'
             atomically (writeTChan out (d, t))
       modifyMVar_ (cxThreads cx) (return . (threadId:))
+      return out
+
+-- | Rasterize a signal.
+rasterize :: X a -> X a
+rasterize x = case getContextX x of
+  Nothing -> FmapX id x
+  Just cx -> PortX cx tv where
+    tv = unsafePerformIO $ do
+      breadbasket <- newEmptyMVar
+      threadId <- forkIO $ do
+        v0 <- atomically (readX 0 x)
+        out <- newTVarIO v0
+        putMVar breadbasket out
+        forever $ do
+          now <- chron (cxEpoch cx)
+          atomically $ do
+            vt <- readX now x
+            writeTVar out vt
+          threadDelay 10000
+      modifyMVar_ (cxThreads cx) (return . (threadId:))
+      out <- readMVar breadbasket
       return out
 
 chron :: UTCTime -> IO Double
@@ -400,8 +436,8 @@ newE = do
 -- | Setup a thread to react to events. The callback will be provided with
 -- the time of the event which is measured in seconds since the start of
 -- the simulation.
-output :: E a -> (Time -> a -> IO ()) -> Setup ()
-output e0 act = do
+output :: (Time -> a -> IO ()) -> E a -> Setup ()
+output act e0 = do
   cx <- getContext
   setupIO $ do
     e <- dupE e0
@@ -451,7 +487,7 @@ debugE toString e = unsafePerformIO $ do
 debugX :: Eq a => ((a, a) -> String) -> X a -> X a
 debugX toString sig =
   let diff a b = if a == b then Nothing else Just (a,b) in
-  let e = edge sig diff in
+  let e = edge diff sig in
   unsafePerformIO $ do
     _ <- forkIO $ do
       e' <- dupE e
