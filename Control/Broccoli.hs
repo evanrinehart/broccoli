@@ -2,6 +2,7 @@
 
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TupleSections #-}
 module Control.Broccoli (
   X,
   E,
@@ -22,6 +23,9 @@ module Control.Broccoli (
   filterE,
   delayE,
   delayX,
+  dilate,
+  timeWarp,
+  delayE',
   rasterize,
 
   -- * Setup IO interface
@@ -59,8 +63,8 @@ data X a where
   FmapX :: forall a b . (b -> a) -> X b -> X a
   ApplX :: forall a b . X (b -> a) -> X b -> X a
   MappendX :: Monoid a => X a -> X a -> X a
-  TimeX :: a ~ Time => Context -> DeltaT -> X a
-  PortX :: Context -> TVar (a,Time) -> X a
+  TimeX :: a ~ Time => Context -> (Time -> Time) -> X a
+  PortX :: a -> Context -> TVar (a,Time) -> X a
 
 -- | @E a@ represents events with values of type @a@.
 -- 
@@ -138,7 +142,16 @@ containsTimeX x = case x of
   ApplX x1 x2 -> containsTimeX x1 || containsTimeX x2
   MappendX x1 x2 -> containsTimeX x1 || containsTimeX x2
   TimeX _ _ -> True
-  PortX _ _ -> False
+  PortX _ _ _ -> False
+
+containsPortsX :: X a -> Bool
+containsPortsX x = case x of
+  PureX _ -> False
+  FmapX _ x' -> containsPortsX x'
+  ApplX x1 x2 -> containsPortsX x1 || containsPortsX x2
+  MappendX x1 x2 -> containsPortsX x1 || containsPortsX x2
+  TimeX _ _ -> False
+  PortX _ _ _ -> True
 
 getContextX :: X a -> Maybe Context
 getContextX x = case x of
@@ -147,7 +160,7 @@ getContextX x = case x of
   ApplX x1 x2 -> getFirst $ First (getContextX x1) <> First (getContextX x2)
   MappendX x1 x2 -> getFirst $ First (getContextX x1) <> First (getContextX x2)
   TimeX cx _ -> Just cx
-  PortX cx _ -> Just cx
+  PortX _ cx _ -> Just cx
 
 getContextE :: E a -> Maybe Context
 getContextE e = case e of
@@ -252,8 +265,8 @@ readX time sig = case sig of
     (x1, t1) <- readX time xx1
     (x2, t2) <- readX time xx2
     return (x1 <> x2, max t1 t2)
-  TimeX _ shift -> return (time - shift, time - shift)
-  PortX _ tv -> readTVar tv
+  TimeX _ tmap -> return (tmap time, tmap time)
+  PortX _ _ tv -> readTVar tv
 
 waitE :: E a -> IO a
 waitE e0 = do
@@ -278,13 +291,30 @@ hang :: IO a
 hang = do
   threadDelay (100 * 10^(6::Int))
   hang
+
+unsafeNewPortX :: Context -> a -> (TVar (a, Time) -> IO ()) -> X a
+unsafeNewPortX cx v0 workLoop = PortX v0 cx tv where
+  tv = unsafePerformIO $ do
+    out <- newTVarIO (v0, 0)
+    threadId <- forkIO (workLoop tv)
+    modifyMVar_ (cxThreads cx) (return . (threadId:))
+    return out
+
+unsafeNewPortE :: Context -> (TChan (a, Time) -> IO ()) -> E a
+unsafeNewPortE cx workLoop = PortE cx ch where
+  ch = unsafePerformIO $ do
+    out <- newBroadcastTChanIO
+    threadId <- forkIO (workLoop out)
+    modifyMVar_ (cxThreads cx) (return . (threadId:))
+    return out
+
 ---
 
 -- | An event which gets the value of a signal when another event occurs.
 snapshot :: E a -> X b -> E (a,b)
 snapshot e x = SnapshotE e x
 
--- | Like snapshot but ignores the original event's payload.
+-- | Like 'snapshot' but ignores the original event's payload.
 snapshot_ :: E a -> X b -> E b
 snapshot_ e x = snd <$> snapshot e x
 
@@ -316,28 +346,33 @@ e1 -|- e2 = (Left <$> e1) <> (Right <$> e2)
 voidE :: E a -> E ()
 voidE e = () <$ e
 
+-- | Value of a signal at time zero.
+initialValue :: X a -> a
+initialValue sig = case sig of
+  PureX v -> v
+  TimeX _ tmap -> tmap 0
+  PortX v0 _ _ -> v0
+  FmapX f x -> f (initialValue x)
+  ApplX ff xx -> (initialValue ff) (initialValue xx)
+  MappendX x1 x2 -> mappend (initialValue x1) (initialValue x2)
+
 -- | Sum over events using an initial state and a state transition function.
 accum :: s -> (a -> s -> s) -> E a -> X s
 accum s0 trans e0 = case getContextE e0 of
   Nothing -> pure s0
-  Just cx -> PortX cx tv where
-    tv = unsafePerformIO $ do
-      state <- newTVarIO (s0, 0)
-      threadId <- forkIO $ do
-        e <- dupE e0
-        forever $ do
-          atomically $ do
-            mx <- readE e
-            case mx of
-              TryLater -> retry
-              DropThis -> return ()
-              Normal x t -> do
-                (s,_) <- readTVar state
-                let s' = trans x s
-                writeTVar state (s',t)
-              NotNowNotEver -> error "impossible (2)"
-      modifyMVar_ (cxThreads cx) (return . (threadId:))
-      return state
+  Just cx -> unsafeNewPortX cx s0 $ \tv -> do
+    e <- dupE e0
+    forever $ do
+      atomically $ do
+        mx <- readE e
+        case mx of
+          TryLater -> retry
+          DropThis -> return ()
+          Normal x t -> do
+            (s,_) <- readTVar tv
+            let s' = trans x s
+            writeTVar tv (s',t)
+          NotNowNotEver -> error "impossible (2)"
 
 -- | A signal that remembers the most recent occurrence of an event.
 trap :: a -> E a -> X a
@@ -348,62 +383,73 @@ trap x0 = accum x0 (\x _ -> x)
 -- before and after a change. If the source signal is continuously varying
 -- the edge test will be applied to a rasterized version.
 edge :: (a -> a -> Maybe b) -> X a -> E b
-edge diff src = case getContextX src of
+edge diff sig = case getContextX sig of
   Nothing -> never
-  Just cx -> PortE cx ch where
-    ch = unsafePerformIO $ do
-      out <- newBroadcastTChanIO
-      threadId <- forkIO $ do
-        let x = rasterize src -- implicit rasterization ... x is timeless
-        (v0,_) <- atomically (readX 0 x)
-        ref <- newIORef v0
-        forever $ do
-          v <- readIORef ref
-          (d, v', t) <- atomically $ do
-            (v', t) <- readX undefined x
-            case diff v v' of
-              Just d  -> return (d, v', t)
-              Nothing -> retry
-          writeIORef ref v'
-          atomically (writeTChan out (d, t))
-      modifyMVar_ (cxThreads cx) (return . (threadId:))
-      return out
+  Just cx -> unsafeNewPortE cx $ \out -> do
+    let x = rasterize sig -- implicit rasterization ...
+    let v0 = initialValue sig
+    ref <- newIORef v0
+    forever $ do
+      v <- readIORef ref
+      (d, v', t) <- atomically $ do
+        -- signal was rasterized so we don't need to fabricate any time here
+        (v', t) <- readX undefined x
+        case diff v v' of
+          Just d  -> return (d, v', t)
+          Nothing -> retry
+      writeIORef ref v'
+      atomically (writeTChan out (d, t))
 
 -- | Rasterize a signal.
 rasterize :: X a -> X a
-rasterize x = case getContextX x of
-  Nothing -> x
-  Just cx -> case containsTimeX x of
-    False -> x
-    True -> PortX cx tv where
-      tv = unsafePerformIO $ do
-        breadbasket <- newEmptyMVar
-        threadId <- forkIO $ do
-          v0 <- atomically (readX 0 x)
-          out <- newTVarIO v0
-          putMVar breadbasket out
-          forever $ do
-            now <- chron (cxEpoch cx)
-            atomically $ do
-              vt <- readX now x
-              writeTVar out vt
-            threadDelay 10000
-        modifyMVar_ (cxThreads cx) (return . (threadId:))
-        out <- readMVar breadbasket
-        return out
+rasterize sig = case getContextX sig of
+  Nothing -> sig
+  Just cx -> unsafeNewPortX cx (initialValue sig) $ \tv -> do
+    let period = 0.01
+    now0 <- chron (cxEpoch cx)
+    targetRef <- newIORef now0
+    forever $ do
+      target <- readIORef targetRef
+      atomically (readX target sig >>= writeTVar tv)
+      now <- chron (cxEpoch cx)
+      let newTarget = target + period
+      writeIORef targetRef newTarget
+      let ms = ceiling ((newTarget - now) * million)
+      threadDelay ms
 
-chron :: UTCTime -> IO Double
-chron epoch = do
-  now <- getCurrentTime
-  let time = diffUTCTime now epoch
-  return (realToFrac time)
+-- | Like 'delayE' but the amount of delay is determined on a per-event basis.
+delayE' :: E (a, DeltaT) -> E a
+delayE' src = case getContextE src of
+  Nothing -> never
+  Just cx -> unsafeNewPortE cx $ \out -> do
+    e <- dupE src
+    forever $ do
+      ((v,dt), t) <- readEIO e
+      let t' = t + max dt 0
+      let io = atomically (writeTChan out (v, t'))
+      cxDefer cx t' io
 
-newInternalBoot :: Context -> IO (E (), IO ())
-newInternalBoot cx = do
-  bch <- newBroadcastTChanIO
-  return
-    ( PortE cx bch
-    , atomically (writeTChan bch ((), 0)) )
+-- | Delay occurrences of an event.
+delayE :: DeltaT -> E a -> E a
+delayE delta e = delayE' (fmap (,delta) e)
+
+-- | Shift a signal ahead in time.
+delayX :: DeltaT -> X a -> X a
+delayX delta = timeWarp (subtract delta) (+delta)
+
+-- | Slowdown a signal by a factor.
+dilate :: Double -> X a -> X a
+dilate rate = timeWarp (/rate) (*rate)
+
+-- | Modify the time domain of a signal using an automorphism of time.
+timeWarp :: (Time -> Time) -> (Time -> Time) -> X a -> X a
+timeWarp g ginv sig = case sig of
+  PureX _ -> sig
+  TimeX cx f -> TimeX cx (f . g)
+  PortX v0 cx tv -> warpPortX v0 cx tv ginv
+  FmapX f x -> FmapX f (timeWarp g ginv x)
+  ApplX ff xx -> ApplX (timeWarp g ginv ff) (timeWarp g ginv xx)
+  MappendX x1 x2 -> MappendX (timeWarp g ginv x1) (timeWarp g ginv x2)
 
 -- | Creates a new input signal with an initial value. Use 'input' to feed
 -- data to the signal during the simulation.
@@ -413,7 +459,7 @@ newX v = do
   let epoch = cxEpoch cx
   tv <- setupIO (newTVarIO (v,0))
   return
-    ( PortX cx tv
+    ( PortX v cx tv
     , \x -> do
         now <- chron epoch
         atomically (writeTVar tv (x,now)))
@@ -465,7 +511,7 @@ runProgram setup = do
   epoch <- getCurrentTime
   defer <- newScheduler epoch mv
   let cx = Context mv epoch defer
-  let time = TimeX cx 0
+  let time = TimeX cx id
   (onBoot, boot) <- newInternalBoot cx
   let Setup act = setup onBoot time
   exit <- act cx
@@ -497,65 +543,34 @@ debugX toString sig =
         putStrLn (toString x)
     return sig
 
+chron :: UTCTime -> IO Double
+chron epoch = do
+  now <- getCurrentTime
+  let time = diffUTCTime now epoch
+  return (realToFrac time)
 
--- | Delay occurrences of an event.
-delayE :: E (a, DeltaT) -> E a
-delayE src = case getContextE src of
-  Nothing -> never
-  Just cx -> PortE cx ch where
-    ch = unsafePerformIO $ do
-      out <- newBroadcastTChanIO
-      threadId <- forkIO $ do
-        e <- dupE src
-        forever $ do
-          result <- atomically $ do
-            eResult <- readE e
-            case eResult of
-              TryLater -> retry
-              DropThis -> return Nothing
-              Normal (x, dt) t -> return (Just (t + max dt 0, x))
-              NotNowNotEver -> error "impossible (2)"
-          case result of
-            Nothing -> return ()
-            Just (t', x) -> do
-              let io = atomically (writeTChan out (x, t'))
-              cxDefer cx t' io
-      modifyMVar_ (cxThreads cx) (return . (threadId:))
-      return out
+newInternalBoot :: Context -> IO (E (), IO ())
+newInternalBoot cx = do
+  bch <- newBroadcastTChanIO
+  return
+    ( PortE cx bch
+    , atomically (writeTChan bch ((), 0)) )
 
--- | Shift a signal ahead in time.
-delayX :: DeltaT -> X a -> X a
-delayX delta src | delta < 0 = error "delayX: negative delay"
-                 | otherwise = case getContextX src of
-  Nothing -> src
-  Just cx -> case containsTimeX src of
-    False -> PortX cx tv where
-      tv = unsafePerformIO $ do
-        (v0,_) <- atomically (readX 0 src)
-        state <- newTVarIO (v0, 0)
-        latest <- newIORef 0
-        threadId <- forkIO $ do
-          forever $ do
-            t <- readIORef latest
-            (v,t') <- atomically $ do
-              (v, t') <- readX t src
-              if t' > t then return (v,t') else retry
-            writeIORef latest t'
-            let t'' = t' + delta
-            let io = atomically (writeTVar tv (v,t''))
-            cxDefer cx t'' io
-        modifyMVar_ (cxThreads cx) (return . (threadId:))
-        return state
-    True -> delayX' delta src
-
-delayX' :: DeltaT -> X a -> X a
-delayX' delta x = case x of
-  PureX v -> x
-  FmapX f x' -> FmapX f (delayX' delta x')
-  ApplX ff xx -> ApplX (delayX' delta ff) (delayX' delta xx)
-  MappendX xx1 xx2 -> MappendX (delayX' delta xx1) (delayX' delta xx2)
-  TimeX cx shift -> TimeX cx (shift + delta)
-  PortX cx tv -> delayX delta (PortX cx tv)
+-- move changes in a signal to the future
+warpPortX :: a -> Context -> TVar (a, Time) -> (Time -> Time) -> X a
+warpPortX v0 cx srcTV ginv = unsafeNewPortX cx v0 $ \tv -> do
+  latest <- newIORef 0
+  forever $ do
+    t <- readIORef latest
+    (v,t') <- atomically $ do
+      (v, t') <- readTVar srcTV
+      if t' > t then return (v,t') else retry
+    writeIORef latest t'
+    let t'' = ginv t'
+    let io = atomically (writeTVar tv (v,t''))
+    -- at this point we can decide to drop events that were mapped into the past
+    -- or to map them to the current time
+    cxDefer cx (max t'' t') io
 
 newScheduler :: UTCTime -> MVar [ThreadId] -> IO (Time -> IO () -> IO ())
 newScheduler epoch threads = do
@@ -581,7 +596,7 @@ dispatcher epoch wake mv = forever $ do
   case nextWake of
     Nothing -> readChan wake
     Just tNext -> do
-      let ms = floor (min (tNext - now) 10 * million)
+      let ms = ceiling (min (tNext - now) 10 * million)
       cancel <- cancellableThread (threadDelay ms >> writeChan wake ())
       readChan wake
       cancel
@@ -602,3 +617,28 @@ cancellableThread io = do
     case mtarget of
       Nothing -> return ()
       Just target -> killThread target
+
+data SignalView =
+  Constant |
+  TimeOnly Context |
+  PortsOnly Context |
+  TimeAndPorts Context
+
+signalView :: X a -> SignalView
+signalView sig = case getContextX sig of
+  Nothing -> Constant 
+  Just cx -> case containsTimeX sig of
+    False -> PortsOnly cx
+    True -> case containsPortsX sig of
+      False -> TimeOnly cx
+      True -> TimeAndPorts cx
+
+sampleX :: X a -> Time -> a
+sampleX sig t = case sig of
+  PureX v -> v
+  TimeX _ tmap -> tmap t
+  PortX v0 _ _ -> error "sampleX expects time-only signals"
+  FmapX f x -> f (sampleX x t)
+  ApplX ff xx -> (sampleX ff t) (sampleX xx t)
+  MappendX x1 x2 -> mappend (sampleX x1 t) (sampleX x2 t)
+
