@@ -618,21 +618,6 @@ cancellableThread io = do
       Nothing -> return ()
       Just target -> killThread target
 
-data SignalView =
-  Constant |
-  TimeOnly Context |
-  PortsOnly Context |
-  TimeAndPorts Context
-
-signalView :: X a -> SignalView
-signalView sig = case getContextX sig of
-  Nothing -> Constant 
-  Just cx -> case containsTimeX sig of
-    False -> PortsOnly cx
-    True -> case containsPortsX sig of
-      False -> TimeOnly cx
-      True -> TimeAndPorts cx
-
 sampleX :: X a -> Time -> a
 sampleX sig t = case sig of
   PureX v -> v
