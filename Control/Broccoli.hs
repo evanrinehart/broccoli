@@ -21,6 +21,7 @@ module Control.Broccoli (
   justE,
   maybeE,
   filterE,
+  multiplex,
   delayE,
   delayX,
   dilate,
@@ -47,7 +48,7 @@ module Control.Broccoli (
 
 import Control.Applicative
 import Data.Monoid
-import Control.Monad (forever, ap)
+import Control.Monad (forever, ap, msum)
 import Data.IORef
 import Control.Concurrent
 import Control.Concurrent.STM
@@ -55,6 +56,7 @@ import System.IO.Unsafe
 import Data.Time
 import Data.Sequence
 import Data.Foldable (toList)
+import Data.List (intercalate)
 
 --import Debug.Trace
 --import Unsafe.Coerce
@@ -67,6 +69,7 @@ data X a where
   FmapX :: forall a b . (b -> a) -> X b -> X a
   ApplX :: forall a b . X (b -> a) -> X b -> X a
   MappendX :: Monoid a => X a -> X a -> X a
+  MultiX :: forall a b . a ~ [b] => [X b] -> X a
   TimeX :: a ~ Time => Context -> (Time -> Time) -> X a
   PortX :: a -> Context -> TVar (a,Time) -> X a
 
@@ -146,6 +149,7 @@ getContextX x = case x of
   MappendX x1 x2 -> getFirst $ First (getContextX x1) <> First (getContextX x2)
   TimeX cx _ -> Just cx
   PortX _ cx _ -> Just cx
+  MultiX xs -> msum (map getContextX xs)
 
 getContextE :: E a -> Maybe Context
 getContextE e = case e of
@@ -266,6 +270,10 @@ readX time sig = case sig of
     return (x1 <> x2, max t1 t2)
   TimeX _ tmap -> return (tmap time, tmap time)
   PortX _ _ tv -> readTVar tv
+  MultiX xs -> do
+    pairs <- mapM (readX time) xs
+    let maxT = maximum (map snd pairs)
+    return (map fst pairs, maxT)
 
 waitE :: E a -> IO a
 waitE e0 = do
@@ -361,6 +369,7 @@ initialValue sig = case sig of
   FmapX f x -> f (initialValue x)
   ApplX ff xx -> (initialValue ff) (initialValue xx)
   MappendX x1 x2 -> mappend (initialValue x1) (initialValue x2)
+  MultiX xs -> map initialValue xs
 
 -- | Sum over events using an initial state and a state transition function.
 accum :: s -> (a -> s -> s) -> E a -> X s
@@ -411,6 +420,7 @@ showSignal sig = case sig of
   FmapX _ x -> "FmapX ? (" ++ showSignal x ++ ")"
   ApplX ff xx -> "ApplX ("++showSignal ff++") ("++showSignal xx++")"
   MappendX x1 x2 -> "Mappend ("++showSignal x1++") ("++showSignal x2++")"
+  MultiX xs -> "MultiX ["++intercalate "," (map showSignal xs)++"]"
 
 -- | Rasterize a signal. If there are several edge tests on a continuous
 -- signal then it's better to explicitly rasterize before.
@@ -440,7 +450,11 @@ containsTimeX x = case x of
   MappendX x1 x2 -> containsTimeX x1 || containsTimeX x2
   TimeX _ _ -> True
   PortX _ _ _ -> False
+  MultiX xs -> or (map containsTimeX xs)
 
+-- | From many signals, one.
+multiplex :: [X a] -> X [a]
+multiplex sigs = MultiX sigs
 
 -- | Like 'delayE' but the amount of delay is determined on a per-event basis.
 delayE' :: E (a, DeltaT) -> E a
@@ -475,6 +489,7 @@ timeWarp g sig = case sig of
   FmapX f x -> FmapX f (timeWarp g x)
   ApplX ff xx -> ApplX (timeWarp g ff) (timeWarp g xx)
   MappendX x1 x2 -> MappendX (timeWarp g x1) (timeWarp g x2)
+  MultiX xs -> MultiX (map (timeWarp g) xs)
 
 -- | Like 'timeWarp' but works with events. The inverse of the warp function
 -- must exist and be provided.
@@ -489,6 +504,7 @@ timeWarp' g ginv sig = case sig of
   FmapX f x -> FmapX f (timeWarp' g ginv x)
   ApplX ff xx -> ApplX (timeWarp' g ginv ff) (timeWarp' g ginv xx)
   MappendX x1 x2 -> MappendX (timeWarp' g ginv x1) (timeWarp' g ginv x2)
+  MultiX xs -> MultiX (map (timeWarp' g ginv) xs)
 
 -- | Creates a new input signal with an initial value. Use 'input' to feed
 -- data to the signal during the simulation.
@@ -657,4 +673,4 @@ sampleX sig t = case sig of
   FmapX f x -> f (sampleX x t)
   ApplX ff xx -> (sampleX ff t) (sampleX xx t)
   MappendX x1 x2 -> mappend (sampleX x1 t) (sampleX x2 t)
-
+  MultiX xs -> map (flip sampleX t) xs

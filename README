@@ -3,16 +3,15 @@ fmap       :: (a -> b) -> E a -> E b
 pure       :: a -> X a
 <*>        :: X (a -> b) -> X a -> X b
 never      :: E a
-<>         :: E a -> E a -> E a
+unionE     :: E a -> E a -> E a
 snapshot   :: E a -> X b -> E (a, b)
 snapshot_  :: E a -> X b -> E b
-accumulate :: E a -> s -> (a -> s -> s) -> X s
-edge       :: X a -> (a -> a -> Maybe b) -> E b
+accum      :: s -> (a -> s -> s) -> E a -> X s
+edge       :: (a -> a -> Maybe b) -> X a -> E b
+trap       :: a -> E a -> X a
+multiplex  :: [X a] -> X [a]
 justE      :: E (Maybe a) -> E a
-maybeE     :: (a -> Maybe b) -> E a -> E b
-filterE    :: (a -> Bool) -> E a -> E a
-newX       :: a -> Setup (a -> IO (), X a)
-newE       :: Setup (a -> IO (), E a)
-input      :: IO () -> Setup ()
-output     :: E a -> (a -> IO ()) -> Setup ()
-runProgram :: Setup (IO (), E ()) -> IO ()
+delayE     :: DeltaT -> E a -> E a
+delayX     :: DeltaT -> X a -> X a
+dilate     :: Double -> X a -> X a
+timeWarp   :: (Time -> Time) -> X a -> X a
