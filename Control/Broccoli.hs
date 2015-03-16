@@ -462,7 +462,7 @@ timeWarp :: (Time -> Time) -> X a -> X a
 timeWarp g sig = case sig of
   PureX _ -> sig
   TimeX cx f -> TimeX cx (f . g)
-  PortX v0 cx tv -> error "timeWarp1: can't grok expression"
+  PortX _ _ _ -> error "timeWarp: Can't handle events. Try timeWarp'."
   FmapX f x -> FmapX f (timeWarp g x)
   ApplX ff xx -> ApplX (timeWarp g ff) (timeWarp g xx)
   MappendX x1 x2 -> MappendX (timeWarp g x1) (timeWarp g x2)
