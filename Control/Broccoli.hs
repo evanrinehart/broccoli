@@ -384,10 +384,8 @@ accum s0 trans e0 = case getContextE e0 of
 trap :: a -> E a -> X a
 trap x0 = accum x0 (\x _ -> x)
 
--- | An event that occurs when an edge is detected in a signal. When a signal
--- changes discretely the edge test is evaluated on the values immediately
--- before and after a change. If the source signal is continuously varying
--- the edge test will be applied to a rasterized version.
+-- | An event that occurs on "edges" detected in a signal. The signal will
+-- be rasterized if necessary for this to make sense.
 edge :: (a -> a -> Maybe b) -> X a -> E b
 edge diff sig = case getContextX sig of
   Nothing -> never
@@ -414,7 +412,8 @@ showSignal sig = case sig of
   ApplX ff xx -> "ApplX ("++showSignal ff++") ("++showSignal xx++")"
   MappendX x1 x2 -> "Mappend ("++showSignal x1++") ("++showSignal x2++")"
 
--- | Rasterize a signal.
+-- | Rasterize a signal. If there are several edge tests on a continuous
+-- signal then it's better to explicitly rasterize before.
 rasterize :: X a -> X a
 rasterize sig = case getContextX sig of
   Nothing -> sig
@@ -463,7 +462,7 @@ delayE delta e = delayE' (fmap (,delta) e)
 delayX :: DeltaT -> X a -> X a
 delayX delta = timeWarp' (subtract delta) (+delta)
 
--- | Slowdown a signal by a factor.
+-- | Slow down a signal by a factor.
 dilate :: Double -> X a -> X a
 dilate rate = timeWarp' (/rate) (*rate)
 
@@ -477,9 +476,12 @@ timeWarp g sig = case sig of
   ApplX ff xx -> ApplX (timeWarp g ff) (timeWarp g xx)
   MappendX x1 x2 -> MappendX (timeWarp g x1) (timeWarp g x2)
 
--- | Like 'timeWarp' but works with causal events. Thus the inverse
--- of the warp function must exist and be provided.
-timeWarp' :: (Time -> Time) -> (Time -> Time) -> X a -> X a
+-- | Like 'timeWarp' but works with events. The inverse of the warp function
+-- must exist and be provided.
+timeWarp' :: (Time -> Time)
+          -> (Time -> Time) -- ^ inverse of warp
+          -> X a
+          -> X a
 timeWarp' g ginv sig = case sig of
   PureX _ -> sig
   TimeX cx f -> TimeX cx (f . g)
@@ -487,7 +489,6 @@ timeWarp' g ginv sig = case sig of
   FmapX f x -> FmapX f (timeWarp' g ginv x)
   ApplX ff xx -> ApplX (timeWarp' g ginv ff) (timeWarp' g ginv xx)
   MappendX x1 x2 -> MappendX (timeWarp' g ginv x1) (timeWarp' g ginv x2)
-
 
 -- | Creates a new input signal with an initial value. Use 'input' to feed
 -- data to the signal during the simulation.
@@ -567,7 +568,7 @@ debugE toString e = unsafePerformIO $ do
     putStrLn (toString x)
   return e
 
--- | Print out transitions in a signal. Only for debugging purposes.
+-- | Print out transitions in a signal, rasterizing if necessary. Only for debugging purposes.
 debugX :: Eq a => ((a, a) -> String) -> X a -> X a
 debugX toString sig =
   let diff a b = if a == b then Nothing else Just (a,b) in
