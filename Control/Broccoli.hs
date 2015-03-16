@@ -80,6 +80,7 @@ data E a where
   SnapshotE :: a ~ (b,c) => E b -> X c -> E a
   JustE     :: E (Maybe a) -> E a
   PortE     :: Context -> TChan (a, Time) -> E a
+  SingleE   :: Context -> TMVar a -> E a
 
 instance Functor X where
   fmap f x = FmapX f x
@@ -154,6 +155,7 @@ getContextE e = case e of
   SnapshotE e' x -> getFirst $ First (getContextE e') <> First (getContextX x)
   JustE e' -> getContextE e'
   PortE cx _ -> Just cx
+  SingleE cx _ -> Just cx
 
 dupE :: E a -> IO (E a)
 dupE e = case e of
@@ -174,6 +176,10 @@ dupE e = case e of
   PortE mv ch -> do
     ch' <- atomically (dupTChan ch)
     return (PortE mv ch')
+  SingleE cx mv -> do
+    x <- atomically (readTMVar mv)
+    mv' <- newTMVarIO x
+    return (SingleE cx mv')
 
 data Promise a = Promise { force :: IO a }
 
@@ -238,6 +244,11 @@ readE e = case e of
       else do
         (v, t) <- readTChan ch
         return (Normal v t)
+  SingleE _ mv -> do
+    attempt <- tryTakeTMVar mv
+    case attempt of
+      Nothing -> return NotNowNotEver
+      Just v -> return (Normal v 0)
 
 readX :: Double -> X a -> STM (a, Time)
 readX time sig = case sig of
@@ -411,14 +422,14 @@ rasterize sig = case getContextX sig of
     False -> sig
     True -> unsafeNewPortX cx (initialValue sig) $ \tv -> do
       let period = 0.01
-      now0 <- chron (cxEpoch cx)
-      targetRef <- newIORef now0
+      counterRef <- newIORef 0
       forever $ do
-        target <- readIORef targetRef
+        counter <- readIORef counterRef
+        let target = counter * period
         atomically (readX target sig >>= writeTVar tv)
         now <- chron (cxEpoch cx)
-        let newTarget = target + period
-        writeIORef targetRef newTarget
+        let newTarget = (counter+1) * period
+        writeIORef counterRef (counter+1)
         let ms = ceiling ((newTarget - now) * million)
         threadDelay ms
 
@@ -540,11 +551,9 @@ runProgram setup = do
   defer <- newScheduler epoch mv
   let cx = Context mv epoch defer
   let time = TimeX cx id
-  (onBoot, boot) <- newInternalBoot cx
+  onBoot <- SingleE cx <$> newTMVarIO ()
   let Setup act = setup onBoot time
   exit <- act cx
-  --threadDelay 5000
-  boot
   waitE exit
   _ <- withMVar mv (mapM killThread)
   return ()
@@ -576,13 +585,6 @@ chron epoch = do
   now <- getCurrentTime
   let time = diffUTCTime now epoch
   return (realToFrac time)
-
-newInternalBoot :: Context -> IO (E (), IO ())
-newInternalBoot cx = do
-  bch <- newBroadcastTChanIO
-  return
-    ( PortE cx bch
-    , atomically (writeTChan bch ((), 0)) )
 
 -- move changes in a signal to the future
 warpPortX :: a -> Context -> TVar (a, Time) -> (Time -> Time) -> X a
