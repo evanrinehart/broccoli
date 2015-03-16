@@ -25,6 +25,7 @@ module Control.Broccoli (
   delayX,
   dilate,
   timeWarp,
+  timeWarp',
   delayE',
   rasterize,
 
@@ -117,10 +118,8 @@ instance Applicative Setup where
 instance Functor Setup where
   fmap f (Setup io) = Setup (\mv -> f <$> io mv)
 
--- | Time is measured from the beginning of a simulation in seconds.
 type Time = Double
 
--- | Difference of two time values.
 type DeltaT = Double
 
 -- | The boot event occurs once at the beginning of a simulation.
@@ -452,21 +451,33 @@ delayE delta e = delayE' (fmap (,delta) e)
 
 -- | Shift a signal ahead in time.
 delayX :: DeltaT -> X a -> X a
-delayX delta = timeWarp (subtract delta) (+delta)
+delayX delta = timeWarp' (subtract delta) (+delta)
 
 -- | Slowdown a signal by a factor.
 dilate :: Double -> X a -> X a
-dilate rate = timeWarp (/rate) (*rate)
+dilate rate = timeWarp' (/rate) (*rate)
 
--- | Modify the time domain of a signal using an automorphism of time.
-timeWarp :: (Time -> Time) -> (Time -> Time) -> X a -> X a
-timeWarp g ginv sig = case sig of
+-- | Time warp a signal.
+timeWarp :: (Time -> Time) -> X a -> X a
+timeWarp g sig = case sig of
+  PureX _ -> sig
+  TimeX cx f -> TimeX cx (f . g)
+  PortX v0 cx tv -> error "timeWarp1: can't grok expression"
+  FmapX f x -> FmapX f (timeWarp g x)
+  ApplX ff xx -> ApplX (timeWarp g ff) (timeWarp g xx)
+  MappendX x1 x2 -> MappendX (timeWarp g x1) (timeWarp g x2)
+
+-- | Like 'timeWarp' but works with causal events. Thus the inverse
+-- of the warp function must exist and be provided.
+timeWarp' :: (Time -> Time) -> (Time -> Time) -> X a -> X a
+timeWarp' g ginv sig = case sig of
   PureX _ -> sig
   TimeX cx f -> TimeX cx (f . g)
   PortX v0 cx tv -> warpPortX v0 cx tv ginv
-  FmapX f x -> FmapX f (timeWarp g ginv x)
-  ApplX ff xx -> ApplX (timeWarp g ginv ff) (timeWarp g ginv xx)
-  MappendX x1 x2 -> MappendX (timeWarp g ginv x1) (timeWarp g ginv x2)
+  FmapX f x -> FmapX f (timeWarp' g ginv x)
+  ApplX ff xx -> ApplX (timeWarp' g ginv ff) (timeWarp' g ginv xx)
+  MappendX x1 x2 -> MappendX (timeWarp' g ginv x1) (timeWarp' g ginv x2)
+
 
 -- | Creates a new input signal with an initial value. Use 'input' to feed
 -- data to the signal during the simulation.
@@ -521,7 +532,8 @@ input handler = do
     return ()
 
 -- | Runs a program defined by the setup computation. The simulation ends
--- if the returned event occurs.
+-- if the returned event occurs. The provided time signal is in units
+-- of seconds with zero at the beginning of the simulation.
 runProgram :: (E Boot -> X Time -> Setup (E ())) -> IO ()
 runProgram setup = do
   mv <- newMVar []
