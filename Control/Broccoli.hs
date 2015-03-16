@@ -410,7 +410,6 @@ rasterize sig = case getContextX sig of
   Just cx -> case containsTimeX sig of
     False -> sig
     True -> unsafeNewPortX cx (initialValue sig) $ \tv -> do
-      putStrLn "rasterize"
       let period = 0.01
       now0 <- chron (cxEpoch cx)
       targetRef <- newIORef now0
