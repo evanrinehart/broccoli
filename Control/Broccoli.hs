@@ -66,24 +66,95 @@ import Data.List (intercalate)
 -- > X a = Time -> a
 data X a where
   PureX :: a -> X a
+  TimeX :: X a
   FmapX :: forall a b . (b -> a) -> X b -> X a
   ApplX :: forall a b . X (b -> a) -> X b -> X a
   MappendX :: Monoid a => X a -> X a -> X a
   MultiX :: forall a b . a ~ [b] => [X b] -> X a
-  TimeX :: a ~ Time => Context -> (Time -> Time) -> X a
-  PortX :: a -> Context -> TVar (a,Time) -> X a
+  PortX :: forall a b . a
+        -> Either (X b) (E b)
+        -> UID
+        -> IVar (TVar (a,Time))
+        -> IO [ThreadId]
+        -> X a
 
 -- | @E a@ represents events with values of type @a@.
 -- 
--- > E a = [(Time, a)]
+-- > E a = [(a, Time)]
 data E a where
-  NeverE    :: E a
+  ConstantE :: [(a, Time)] -> E a
   FmapE     :: forall a b . (b -> a) -> E b -> E a
   MappendE  :: E a -> E a -> E a
   SnapshotE :: a ~ (b,c) => E b -> X c -> E a
   JustE     :: E (Maybe a) -> E a
-  PortE     :: Context -> TChan (a, Time) -> E a
-  SingleE   :: Context -> TMVar a -> E a
+  PortE     :: forall a b . Either (X b) (E b)
+            -> UID
+            -> IVar (ER a)
+            -> (UTCTime -> IO (ER a))
+            -> Int
+            -> E a
+  InputE :: UID -> IVar (ER a) -> (UTCTime -> IO ()) -> Int -> E a
+
+-- you have steps in running a program
+-- 1. replicate program 
+-- 2. activate sources
+-- 3. result should be IO (a, Time)
+
+-- runtime event source
+data ER a = ER
+  { nextOcc    :: Time -> STM (Maybe (a, Time))
+  , nextOcc'   :: Time -> STM (Maybe (a, Time))
+  , allBefore  :: Time -> STM [(a, Time)]
+  , allBefore' :: Time -> STM [(a, Time)] }
+
+nullER :: ER a
+nullER = ER
+  { nextOcc _ = return Nothing
+  , nextOcc _ = return Nothing
+  , allBefore _ = return []
+  , allBefore' _ = return [] }
+
+type Activate a = UTCTime -> IO (ER a)
+
+runE :: (Time -> a -> IO ()) -> E a -> IO ()
+runE act e = do
+  now <- getCurrentTime
+  er <- activateE now e
+  tref <- newIORef 0
+  forever $ do
+    t <- readIORef tref
+    (x, t') <- waitE t er
+    writeIORef tref t'
+    act t' x
+
+inputE :: (TChan a -> IO ()) -> E a
+inputE work = InputE uid activate where
+  uid = unsafePerformIO newUID
+  eriv = unsafePerformIO newIVar
+  activate epoch = do
+    -- create a broad cast tchan
+    -- create an empty database of event occs
+    -- setup the ER to query and modify this database
+    newBroadcastTChan 
+    writeIVar eriv nullER
+
+-- activate sources
+-- replicate components, counting expected worker population
+-- when numbers add up, fork input threads
+
+-- leads to wanting more information about a running program
+-- which is what i tried to do today anyway, set up component test bench :(
+-- (also to fix the backward time warp)
+
+
+activateE :: UTCTime -> E a -> IO (ER a)
+
+waitE :: Time -> ER a -> IO (a, Time)
+waitE t er = atomically $ do
+  mr <- nextOcc er t
+  case mr of
+    Nothing -> retry
+    Just xt -> return xt
 
 instance Functor X where
   fmap f x = FmapX f x
@@ -674,3 +745,49 @@ sampleX sig t = case sig of
   ApplX ff xx -> (sampleX ff t) (sampleX xx t)
   MappendX x1 x2 -> mappend (sampleX x1 t) (sampleX x2 t)
   MultiX xs -> map (flip sampleX t) xs
+
+-- write once variable -- reading before writing blocks until written
+data IVar a = IVar (TVar (Maybe a))
+
+newIVar :: IO (IVar a)
+newIVar = do
+  tv <- newTVarIO Nothing
+  return (IVar tv)
+
+readIVarIO :: IVar a -> IO a
+readIVarIO iv = atomically (readIVar iv)
+
+readIVar :: IVar a -> STM a
+readIVar (IVar tv) = 
+  mx <- readTVar tv
+  case mx of
+    Nothing -> retry
+    Just x -> return x
+
+writeIVar :: IVar a -> a -> STM ()
+writeIVar (IVar tv) x = do
+  mx <- readTVar tv
+  case mx of
+    Nothing -> writeTVar tv x
+    Just _ -> error "tried to write an IVar twice"
+
+writeIVarIO :: IVar a -> a -> IO ()
+writeIVarIO iv x = atomically (writeIVar iv x)
+
+dupIVar :: IVar a -> STM (IVar a)
+dupIVar (IVar tv) = do
+  prev <- readTVar tv
+  tv' <- newTVar prev
+  return (IVar tv')
+
+isBlankIVar :: IVar a -> STM Bool
+isBlankIVar (IVar tv) = do
+  mx <- readTVar tv
+  case mx of
+    Nothing -> True
+    Just _ -> False
+
+
+type UID = Integer
+newUID :: IO UID
+newUID = randomRIO (0, 2^128-1)
