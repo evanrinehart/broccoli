@@ -34,7 +34,7 @@ edge diff sig = (justE . fmap (uncurry diff) . Accum1E v0) e where
   v0 = sampleX sig 0
   e = fromMaybe (snapshot_ RasterE sig) (unX sig)
 
-occurs :: [(a, Time)] -> E a
+occurs :: [(Time, a)] -> E a
 occurs = ConstantE . sortBy (comparing fst)
 
 time :: X Time
