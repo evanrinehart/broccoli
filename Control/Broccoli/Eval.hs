@@ -1,6 +1,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
-module Eval where
+module Control.Broccoli.Eval where
 
 import Control.Applicative
 import Data.List
@@ -8,8 +8,27 @@ import Data.Ord
 import Data.Monoid
 import Data.Maybe
 import Data.Traversable
+import Control.Comonad
 
-import Prog
+import Control.Broccoli.Types
+
+-- | An event that never happens.
+never :: E a
+never = ConstantE []
+
+-- | Merge all the occurrences from two events together.
+unionE :: E a -> E a -> E a
+unionE = UnionE
+
+
+-- | Measure the value of a signal at some time.
+at :: X a -> Time -> a
+at = sampleX
+
+-- | List of all the occurrences of an event.
+occs :: E a -> [(Time, a)]
+occs = allOccs
+
 
 -- evaluate a program at a particular time assuming no external stimulus
 sampleX :: X a -> Time -> a
@@ -21,6 +40,7 @@ sampleX arg t = case arg of
   TrapX prim e -> case findOcc e t occZM of
     Nothing -> prim
     Just (_,x) -> x
+  MultiX sigs -> map (\sig -> sampleX sig t) sigs
   TimeWarpX g _ sig -> sampleX sig (g t)
 
 findOcc :: E a -> Time -> OccTest -> Maybe (Time, a)
@@ -57,6 +77,8 @@ findPhase arg t test = case arg of
   TrapX prim e -> case findOcc e t (phaseOcc test) of
     Nothing -> const prim
     Just (_,x) -> const x
+  MultiX sigs -> let phases = map (\sig -> findPhase sig t test) sigs
+                 in \u -> map ($ u) phases
   TimeWarpX g _ sig -> case compare (g 0) (g 1) of
     EQ -> const (sampleX sig (g 0))
     LT -> findPhase sig (g t) test
@@ -94,6 +116,7 @@ unX arg = case arg of
   ApplX _ _ -> Nothing
   TrapX _ e -> Just e
   TimeWarpX _ _ _ -> Nothing
+  MultiX _ -> Nothing
   
 delay :: (Time, (a, Double)) -> (Time, a)
 delay (t, (x, dt)) = (t + dt, x)
@@ -110,9 +133,13 @@ data OccTest = OccTest
 period :: Double
 period = 0.02
 
+tieBreakUnionForward :: (Time,a) -> (Time,a) -> (Time,a)
 tieBreakUnionForward  (u,x) (v,y) = if u <= v then (u,x) else (v,y)
+
+tieBreakUnionBackward :: (Time,a) -> (Time,a) -> (Time,a)
 tieBreakUnionBackward (u,x) (v,y) = if v <= u then (v,x) else (u,y)
 
+occForwardTime :: OccTest
 occForwardTime = OccTest
   { occHay = undefined
   , occRast = undefined
@@ -120,6 +147,7 @@ occForwardTime = OccTest
   , occPhase = phaseMinus
   , occLose = occM }
 
+occBackwardTime :: OccTest
 occBackwardTime = OccTest
   { occHay = undefined
   , occRast = undefined
@@ -127,12 +155,14 @@ occBackwardTime = OccTest
   , occPhase = phasePlus
   , occLose = occP }
 
+occZM :: OccTest
 occZM = occForwardTime
   { occHay = \hay t -> case span (\(t',_) -> t' <= t) hay of
       ([], _) -> Nothing
       (os, _) -> Just (last os)
   , occRast = \t -> realToFrac (floor (t / period) :: Integer) * period } 
 
+occM :: OccTest
 occM = occForwardTime
   { occHay = \hay t -> case span (\(t',_) -> t' < t) hay of
       ([], _) -> Nothing
@@ -141,12 +171,14 @@ occM = occForwardTime
                     in if u == t then u - period else u
   } 
 
+occZP :: OccTest
 occZP = occBackwardTime
   { occHay = \hay t -> case span (\(t',_) -> t' < t) hay of
       (_, []) -> Nothing
       (_, o:_) -> Just o
   , occRast = \t -> realToFrac (ceiling (t / period) :: Integer) * period } 
 
+occP :: OccTest
 occP = occBackwardTime
   { occHay = \hay t -> case span (\(t',_) -> t' <= t) hay of
       (_, []) -> Nothing
@@ -161,10 +193,33 @@ data PhaseTest = PhaseTest
   { phaseOcc :: OccTest
   , phaseReverse :: PhaseTest }
 
+phaseMinus :: PhaseTest
 phaseMinus = PhaseTest
   { phaseOcc = occM
   , phaseReverse = phasePlus }
 
+phasePlus :: PhaseTest
 phasePlus = PhaseTest
   { phaseOcc = occP
   , phaseReverse = phaseMinus }
+
+instance Functor E where
+  fmap f e = FmapE f e
+
+instance Functor X where
+  fmap f sig = FmapX f sig
+
+instance Applicative X where
+  pure x = PureX x
+  ff <*> xx = ApplX ff xx
+
+-- | mempty = 'never', mappend = 'unionE'
+instance Monoid (E a) where
+  mempty = never
+  mappend = unionE
+  
+-- | @extract s@ samples @s@ at @t=0@, @duplicate s@ at @t@ is @timeShift t s@
+instance Comonad X where
+  extract sig = sig `at` 0
+  duplicate sig = f <$> sig <*> TimeX where
+    f x t = TimeWarpX (subtract t) (+ t) sig

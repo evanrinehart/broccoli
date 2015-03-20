@@ -1,4 +1,4 @@
-module Dispatch where
+module Control.Broccoli.Dispatch where
 
 import Control.Monad
 import Control.Concurrent
@@ -8,8 +8,8 @@ import qualified Data.Map as M
 import Data.Time
 import Data.Maybe
 
-import Prog
-import IVar
+import Control.Broccoli.Types
+import Control.Broccoli.IVar
 
 
 -- so there is one static dispatcher. its like got a [(Time, IO ())]
@@ -55,7 +55,7 @@ dispatcher epochIv tv wake = do
       return
         ( fmap (fst . fst) (M.minViewWithKey gt)
         , concatMap snd (M.assocs lt) ++ currents )
-    sequence ios
+    sequence_ ios
     case nextWake of
       Nothing -> atomically (readTChan wake)
       Just tNext -> do

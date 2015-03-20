@@ -1,11 +1,12 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
-module Prog where
+module Control.Broccoli.Types where
 
-import Control.Applicative
-import Data.Monoid
 import Data.IORef
 
+-- | @E a@ represents events with values of type @a@.
+-- 
+-- > E a = [(Time, a)]
 data E a where
   ConstantE :: [(Time, a)] -> E a
   FmapE :: forall a b . (b -> a) -> E b -> E a
@@ -17,28 +18,18 @@ data E a where
   Accum1E :: forall a b . a ~ (b,b) => b -> E b -> E a
   RasterE :: a ~ () => E a
 
+-- | @X a@ represents time signals with values of type @a@.
+-- 
+-- > X a = Time -> a
 data X a where
   PureX :: a -> X a
   TimeX :: a ~ Time => X a
   FmapX :: forall a b . (b -> a) -> X b -> X a
   ApplX :: forall a b . X (b -> a) -> X b -> X a
   TrapX :: a -> E a -> X a
+  MultiX :: a ~ [b] => [X b] -> X a
   TimeWarpX :: (Time -> Time) -> (Time -> Time) -> X a -> X a
 
 type Time = Double
 type Handler a = a -> Time -> IO ()
 
-instance Functor E where
-  fmap f e = FmapE f e
-
-instance Functor X where
-  fmap f sig = FmapX f sig
-
-instance Applicative X where
-  pure x = PureX x
-  ff <*> xx = ApplX ff xx
-
-instance Monoid (E a) where
-  mempty = ConstantE []
-  mappend = UnionE
-  

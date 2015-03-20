@@ -1,6 +1,10 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
-module Exec where
+module Control.Broccoli.Exec (
+  Setup,
+  testE,
+  testX
+) where
 
 import Control.Applicative
 import Control.Concurrent
@@ -14,13 +18,17 @@ import qualified Data.Map as M
 import GHC.Prim (Any)
 import Unsafe.Coerce
 
-import Prog
-import Eval
-import IVar
-import Dispatch
+import Control.Broccoli.Types
+import Control.Broccoli.Eval
+import Control.Broccoli.IVar
+import Control.Broccoli.Dispatch
+import Control.Broccoli.Combinators
 
--- take a program and execute it in real time with real inputs
+-- Take a program and execute it in real time with real inputs.
 
+-- The justification for why this ought to work goes here.
+
+-- | A monad to connect inputs and outputs to a program for simulation.
 newtype Setup a = Setup (Context -> IO a)
 
 instance Monad Setup where
@@ -58,8 +66,10 @@ newContext = do
   rastActions <- newIORef []
   return (Context deferIO hookupsRef rastActions visitedRef threadsRef lockMv epochIv)
 
-runTest :: (Time -> a -> IO ()) -> E a -> IO ()
-runTest action e = do
+-- | Run through an event in real time, executing the IO action on each
+-- occurrence. The computation never terminates.
+testE :: (Time -> a -> IO ()) -> E a -> IO ()
+testE action e = do
   cx <- newContext
   magicE cx e (flip action)
   let ref = cxDeferredHookups cx
@@ -70,19 +80,17 @@ runTest action e = do
   epoch <- getCurrentTime
   writeIVarIO (cxEpochIv cx) epoch
   hang -- finally cleanup
-  
 
--- to run this thing, you need to traverse the program in a Setup monad.
--- this monad can do several things.
--- 1. save the fact that a snapshot variable has been created ... hmmrmm.
--- dont create it again and dont traverse its branch twice.
--- 2. defer setup of dispatchers that you encounter. (delay, timewarp)
+-- | Apply an IO action to arbitrary values of a signal in real time. The
+-- computation never terminates.
+testX :: (Time -> a -> IO ()) -> X a -> IO ()
+testX action sig = testE action (snapshot_ RasterE sig)
 
 -- execute effects to setup runtime handler
 magicE :: Context -> E a -> (a -> Time -> IO ()) -> IO ()
 magicE cx e0 k = case e0 of
   ConstantE [] -> return ()
-  ConstantE occs -> mapM_ (\(t,x) -> cxDeferIO cx t (k x t)) occs
+  ConstantE occs' -> mapM_ (\(t,x) -> cxDeferIO cx t (k x t)) occs'
   FmapE f e -> magicE cx e (\x t -> k (f x) t)
   JustE e -> magicE cx e $ \x t -> case x of
     Nothing -> return ()
@@ -117,6 +125,7 @@ magicX cx arg k = case arg of
   FmapX f sig -> magicX cx sig (\g t -> k (f . g) t)
   ApplX sig1 sig2 -> error "appl"
   TrapX _ e -> magicE cx e (\x t -> k (const x) t)
+  MultiX sigs -> error "multix"
   TimeWarpX tmap tmapInv sig -> magicX cx sig $ \g t -> do
     cxDeferIO cx (tmapInv t) (k g (tmap t))
 
