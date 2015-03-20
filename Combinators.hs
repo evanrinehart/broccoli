@@ -1,3 +1,4 @@
+{-# LANGUAGE TupleSections #-}
 module Combinators where
 
 import Data.Monoid
@@ -39,7 +40,10 @@ accum :: s -> (a -> s -> s) -> E a -> X s
 accum s0 trans e = out where
   out = trap s0 e'
   e' = fmap f (snapshot e out)
-  f s x = trans x s
+  f (x,s) = trans x s
+
+delayE :: Double -> E a -> E a
+delayE dt e = DelayE (fmap (,dt) e)
 
 occurs :: [(Time, a)] -> E a
 occurs = ConstantE . sortBy (comparing fst)
@@ -53,5 +57,6 @@ onBoot = occurs [(0, ())]
 deriv :: Fractional a => X a -> X a
 deriv sig = f <$> sig <*> timeWarp (subtract dt) (+dt) sig where
   dt = 0.001
-  f y1 y0 = (y1 - y0) / dt
+  f y1 y0 = (y1 - y0) / (realToFrac dt)
+
 

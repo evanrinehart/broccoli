@@ -24,7 +24,6 @@ data X a where
   ApplX :: forall a b . X (b -> a) -> X b -> X a
   TrapX :: a -> E a -> X a
   TimeWarpX :: (Time -> Time) -> (Time -> Time) -> X a -> X a
-  InputX :: a -> IORef [Handler a] -> X a
 
 type Time = Double
 type Handler a = a -> Time -> IO ()

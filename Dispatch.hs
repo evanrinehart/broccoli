@@ -30,11 +30,12 @@ newScheduler epochIv = do
   return (schedule tv wake, tid)
 
 schedule :: TVar (Map Time [IO ()]) -> TChan () -> Time -> IO () -> IO ()
-schedule tv wake target action = atomically $ do
-  q <- readTVar tv
-  let q' = M.alter (insertAction action) target q
-  writeTVar tv q'
-  writeTChan wake ()
+schedule tv wake target action = do
+  atomically $ do
+    q <- readTVar tv
+    let q' = M.alter (insertAction action) target q
+    writeTVar tv q'
+    writeTChan wake ()
 
 -- we want new events at the same time to go last
 insertAction :: a -> Maybe [a] -> Maybe [a]
@@ -50,6 +51,7 @@ dispatcher epochIv tv wake = do
       q <- readTVar tv
       let (lt, eq, gt) = M.splitLookup now q
       let currents = fromMaybe [] eq
+      writeTVar tv gt
       return
         ( fmap (fst . fst) (M.minViewWithKey gt)
         , concatMap snd (M.assocs lt) ++ currents )
@@ -87,3 +89,6 @@ getSimulationTime epoch = do
   now <- getCurrentTime
   let time = diffUTCTime now epoch
   return (realToFrac time)
+
+
+

@@ -22,7 +22,6 @@ sampleX arg t = case arg of
     Nothing -> prim
     Just (_,x) -> x
   TimeWarpX g _ sig -> sampleX sig (g t)
-  InputX prim _ -> prim
 
 findOcc :: E a -> Time -> OccTest -> Maybe (Time, a)
 findOcc arg t test = case arg of
@@ -62,7 +61,6 @@ findPhase arg t test = case arg of
     EQ -> const (sampleX sig (g 0))
     LT -> findPhase sig (g t) test
     GT -> findPhase sig (g t) (phaseReverse test)
-  InputX prim _ -> const prim
 
 findJust :: E (Maybe a) -> Time -> OccTest -> Maybe (Time, a)
 findJust e t test = case findOcc e t test of
@@ -96,7 +94,6 @@ unX arg = case arg of
   ApplX _ _ -> Nothing
   TrapX _ e -> Just e
   TimeWarpX _ _ _ -> Nothing
-  InputX _ ref -> Just (InputE ref)
   
 delay :: (Time, (a, Double)) -> (Time, a)
 delay (t, (x, dt)) = (t + dt, x)
