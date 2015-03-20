@@ -7,7 +7,7 @@ import Data.Monoid
 import Data.IORef
 
 data E a where
-  ConstantE :: [(a, Time)] -> E a
+  ConstantE :: [(Time, a)] -> E a
   FmapE :: forall a b . (b -> a) -> E b -> E a
   JustE :: E (Maybe a) -> E a
   UnionE :: E a -> E a -> E a

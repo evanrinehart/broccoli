@@ -2,6 +2,8 @@ module Combinators where
 
 import Data.Monoid
 import Data.Maybe
+import Data.Ord
+import Data.List
 
 import Prog
 import Eval
@@ -31,3 +33,9 @@ edge :: (a -> a -> Maybe b) -> X a -> E b
 edge diff sig = (justE . fmap (uncurry diff) . Accum1E v0) e where
   v0 = sampleX sig 0
   e = fromMaybe (snapshot_ RasterE sig) (unX sig)
+
+occurs :: [(a, Time)] -> E a
+occurs = ConstantE . reverse . sortBy (comparing fst)
+
+time :: X Time
+time = TimeX

@@ -80,7 +80,7 @@ data X a where
 
 -- | @E a@ represents events with values of type @a@.
 -- 
--- > E a = [(a, Time)]
+-- > E a = [(Time, a)]
 data E a where
   ConstantE :: [(a, Time)] -> E a
   FmapE     :: forall a b . (b -> a) -> E b -> E a
