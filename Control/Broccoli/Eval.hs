@@ -10,7 +10,59 @@ import Data.Maybe
 import Data.Traversable
 import Control.Comonad
 
-import Control.Broccoli.Types
+-- | @E a@ represents events with values of type @a@.
+-- 
+-- > E a = [(Time, a)]
+data E a where
+  ConstantE :: [(Time, a)] -> E a
+  FmapE :: forall a b . (b -> a) -> E b -> E a
+  JustE :: E (Maybe a) -> E a
+  UnionE :: E a -> E a -> E a
+  DelayE :: E (a, Double) -> E a
+  SnapshotE :: forall a b c . (c -> b -> a) -> X c -> E b -> E a
+  InputE :: ((a -> Time -> IO ()) -> IO ()) -> E a
+
+-- | @X a@ represents time signals with values of type @a@.
+-- 
+-- > X a = Time -> a
+data X a where
+  PureX :: a -> X a
+  TimeX :: a ~ Time => X a
+  FmapX :: forall a b . (b -> a) -> X b -> X a
+  ApplX :: forall a b . X (b -> a) -> X b -> X a
+  TrapX :: a -> E a -> X a
+  MultiX :: a ~ [b] => [X b] -> X a
+  TimeWarpX :: (Time -> Time) -> (Time -> Time) -> X a -> X a
+  --XF :: forall a b . ((Time -> b) -> (Time -> a)) -> X b -> X a
+
+-- XF h x `at` t = h (x `at`) t
+
+type Time = Double
+type Handler a = a -> Time -> IO ()
+
+instance Functor E where
+  fmap f e = FmapE f e
+
+instance Functor X where
+  fmap f sig = FmapX f sig
+
+instance Applicative X where
+  pure x = PureX x
+  ff <*> xx = ApplX ff xx
+
+-- | mempty = 'never', mappend = 'unionE'
+instance Monoid (E a) where
+  mempty = never
+  mappend = unionE
+  
+-- | extract = 'atZero', duplicate @s@ at @t@ is 'timeShift' @t s@
+instance Comonad X where
+  extract = atZero
+  duplicate x = fmap (\t -> timeShift t x) time
+
+-- | Signal carrying the time since start of simulation in seconds.
+time :: X Time
+time = TimeX
 
 -- | An event that never happens.
 never :: E a
@@ -20,31 +72,55 @@ never = ConstantE []
 unionE :: E a -> E a -> E a
 unionE = UnionE
 
-
--- | Measure the value of a signal at some time.
-at :: X a -> Time -> a
-at = sampleX
+-- | An event with occurrences explicitly listed in ascending order.
+occurs :: [(Time, a)] -> E a
+occurs = ConstantE
 
 -- | List of all the occurrences of an event.
 occs :: E a -> [(Time, a)]
 occs = allOccs
 
--- | The value of a signal at @t = 0@
+-- | > atZero x = x `at` 0
 atZero :: X a -> a
 atZero = (`at` 0)
 
--- evaluate a program at a particular time assuming no external stimulus
-sampleX :: X a -> Time -> a
-sampleX arg t = case arg of
-  PureX x -> x
+-- | Shift a signal forward in time. A negative shift shifts back in time.
+timeShift :: Double -> X a -> X a
+timeShift delta sig = timeWarp (subtract delta) (+ delta) sig
+
+-- | Time warp a signal. The inverse of the warp function must exist and
+-- be provided.
+timeWarp :: (Time -> Time) -> (Time -> Time) -> X a -> X a
+timeWarp = TimeWarpX
+
+-- | Like 'timeWarp' but doesn't require an inverse. Doesn't work with events.
+timeWarp' :: (Time -> Time) -> X a -> X a
+timeWarp' f x = if timeOnlyX x
+  then TimeWarpX f id x
+  else error "timeWarp' can't handle events. Try timewarp."
+
+timeOnlyX :: X a -> Bool
+timeOnlyX arg = case arg of
+  PureX _ -> True
+  TimeX -> True
+  FmapX _ x -> timeOnlyX x
+  ApplX ff xx -> timeOnlyX ff && timeOnlyX xx
+  TrapX _ _ -> False
+  MultiX xs -> and (map timeOnlyX xs)
+  TimeWarpX _ _ x -> timeOnlyX x
+
+-- | Measure the value of a signal at some time.
+at :: X a -> Time -> a
+at arg t = case arg of
+  PureX v -> v
   TimeX -> t
-  FmapX f sig -> f (sampleX sig t)
-  ApplX ff xx -> (sampleX ff t) (sampleX xx t)
+  FmapX f x -> f (x `at` t)
+  ApplX ff xx -> (ff `at` t) (xx `at` t)
   TrapX prim e -> case findOcc e t occZM of
     Nothing -> prim
     Just (_,x) -> x
-  MultiX sigs -> map (\sig -> sampleX sig t) sigs
-  TimeWarpX g _ sig -> sampleX sig (g t)
+  MultiX xs -> map (`at` t) xs
+  TimeWarpX g _ x -> x `at` (g t)
 
 findOcc :: E a -> Time -> OccTest -> Maybe (Time, a)
 findOcc arg t test = case arg of
@@ -64,7 +140,6 @@ findOcc arg t test = case arg of
     Just (tOcc, x) -> let g = findPhase sig tOcc (occPhase test)
                       in Just (tOcc, cons (g tOcc) x)
   InputE _ -> Nothing
-  RasterE -> Just (occRast test t, ())
 
 findPhase :: X a -> Time -> PhaseTest -> (Time -> a)
 findPhase arg t test = case arg of
@@ -77,10 +152,10 @@ findPhase arg t test = case arg of
     Just (_,x) -> const x
   MultiX sigs -> let phases = map (\sig -> findPhase sig t test) sigs
                  in \u -> map ($ u) phases
-  TimeWarpX g _ sig -> case compare (g 0) (g 1) of
-    EQ -> const (sampleX sig (g 0))
-    LT -> findPhase sig (g t) test
-    GT -> findPhase sig (g t) (phaseReverse test)
+  TimeWarpX g _ x -> case compare (g 0) (g 1) of
+    EQ -> const (x `at` (g 0))
+    LT -> findPhase x (g t) test
+    GT -> findPhase x (g t) (phaseReverse test)
 
 findJust :: E (Maybe a) -> Time -> OccTest -> Maybe (Time, a)
 findJust e t test = case findOcc e t test of
@@ -90,15 +165,16 @@ findJust e t test = case findOcc e t test of
 
 allOccs :: E a -> [(Time, a)]
 allOccs arg = case arg of
-  ConstantE os -> reverse os
+  ConstantE os -> os
   FmapE f e -> map (fmap f) (allOccs e)
   JustE e -> (catMaybes . map sequenceA) (allOccs e)
   UnionE e1 e2 -> (allOccs e1) ++ (allOccs e2)
   DelayE e -> sortBy (comparing fst) (map delay (allOccs e))
-  SnapshotE cons sig e -> map f (allOccs e) where
-    f (t, x) = let v = sampleX sig t in (t, cons v x)
+  SnapshotE cons x e -> map f (allOccs e) where
+    f (t, ev) = let g = findPhase x t phaseMinus
+                    xv = g t
+                in (t, cons xv ev)
   InputE _ -> []
-  RasterE -> map (\i -> (i*period, ())) [0..]
 
 foldOccs :: a -> [(Time, a)] -> [(Time, (a,a))]
 foldOccs _ [] = []
@@ -109,7 +185,7 @@ unX :: X a -> Maybe (E a)
 unX arg = case arg of
   PureX _ -> Just mempty
   TimeX -> Nothing
-  FmapX f sig -> fmap (FmapE f) (unX sig)
+  FmapX f x -> fmap (FmapE f) (unX x)
   ApplX _ _ -> Nothing
   TrapX _ e -> Just e
   TimeWarpX _ _ _ -> Nothing
@@ -200,23 +276,3 @@ phasePlus = PhaseTest
   { phaseOcc = occP
   , phaseReverse = phaseMinus }
 
-instance Functor E where
-  fmap f e = FmapE f e
-
-instance Functor X where
-  fmap f sig = FmapX f sig
-
-instance Applicative X where
-  pure x = PureX x
-  ff <*> xx = ApplX ff xx
-
--- | mempty = 'never', mappend = 'unionE'
-instance Monoid (E a) where
-  mempty = never
-  mappend = unionE
-  
--- | extract = 'atZero', duplicate @s@ at @t@ is 'timeShift' @t s@
-instance Comonad X where
-  extract sig = sig `at` 0
-  duplicate sig = f <$> sig <*> TimeX where
-    f x t = TimeWarpX (subtract t) (+ t) sig

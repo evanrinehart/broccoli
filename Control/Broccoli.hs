@@ -6,10 +6,10 @@
 module Control.Broccoli (
   X,
   E,
+  Time,
 
   -- * Event and signal combinators
   time,
-  once,
   never,
   unionE,
   trap,
@@ -17,41 +17,40 @@ module Control.Broccoli (
   delayE,
   snapshot,
   snapshot_,
+  once,
   mealy,
   accum,
   edge,
   occurs,
+  boot,
+  pulse,
   eitherE,
   maybeE,
   filterE,
+  whenE,
   multiplex,
   dilate,
   timeShift,
   timeWarp,
   timeWarp',
-  derivative,
   delayE',
   voidE,
-  raster,
-  rasterize,
-  atZero,
 
-  -- * Pure interface
-  -- | These computations assume that no external input ever occurs.
+  -- * Evaluation
+  -- | These operations assume that no external input ever happens.
   at,
   occs,
+  atZero,
 
-  -- * Running a simulation
-  Setup,
-  testE,
-  testX,
+  -- * Execution
+  simulate,
+  simulate',
 
   -- * Debug
   debugX,
   debugE,
 ) where
 
-import Control.Broccoli.Types
-import Control.Broccoli.Combinators
 import Control.Broccoli.Eval
+import Control.Broccoli.Combinators
 import Control.Broccoli.Exec

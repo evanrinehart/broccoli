@@ -8,7 +8,7 @@ import qualified Data.Map as M
 import Data.Time
 import Data.Maybe
 
-import Control.Broccoli.Types
+import Control.Broccoli.Eval
 import Control.Broccoli.IVar
 
 
@@ -42,7 +42,19 @@ insertAction :: a -> Maybe [a] -> Maybe [a]
 insertAction x Nothing = Just [x]
 insertAction x (Just xs) = Just (xs ++ [x])
 
-dispatcher :: IVar UTCTime -> TVar (Map Time [IO ()]) -> TChan () -> IO ()
+-- the dispatcher is responsive for execute the effects of
+-- 1. constant event occurrence lists
+-- 2. events that happen in real time
+-- 3. events that were scheduled into the future by something
+-- 4. the rasterizer (if anything uses it)
+-- everything except raster actions happen in the order they are specified
+-- in the program, if they happen to occur at the same time. raster effects
+-- happen after all those, in the order rasterizers were specified in the
+-- program.
+dispatcher :: IVar UTCTime
+           -> TVar (Map Time [IO ()])
+           -> TChan ()
+           -> IO ()
 dispatcher epochIv tv wake = do
   epoch <- readIVarIO epochIv
   forever $ do
@@ -87,8 +99,6 @@ cancellableThread io = do
 getSimulationTime :: UTCTime -> IO Double
 getSimulationTime epoch = do
   now <- getCurrentTime
-  let time = diffUTCTime now epoch
-  return (realToFrac time)
-
-
+  let t = diffUTCTime now epoch
+  return (realToFrac t)
 

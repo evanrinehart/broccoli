@@ -8,7 +8,6 @@ import Data.List
 import Control.Applicative
 import Control.Comonad
 
-import Control.Broccoli.Types
 import Control.Broccoli.Eval
 
 
@@ -45,24 +44,11 @@ snapshot = SnapshotE
 snapshot_ :: X a -> E b -> E a
 snapshot_ = snapshot const
 
--- | Time warp a signal.
-timeWarp :: (Time -> Time) -> X a -> X a
-timeWarp f = TimeWarpX f id
-
--- | Like 'timeWarp' but works with events. The inverse of the warp function
--- must exist and be provided.
-timeWarp' :: (Time -> Time) -> (Time -> Time) -> X a -> X a
-timeWarp' = TimeWarpX
-
 -- | Slow down a signal by a factor. A factor less than one is a speed-up.
 dilate :: Double -> X a -> X a
 dilate 0 x = error "dilate zero would be infinitely fast"
-dilate rate x = timeWarp' (*rate) (/rate) x
+dilate rate x = timeWarp (*rate) (/rate) x
 
--- | Shift a signal forward in time. A negative shift shifts back in time.
-timeShift :: Double -> X a -> X a
-timeShift delta sig = timeWarp' (subtract delta) (+ delta) sig
- 
 multiplex :: [X a] -> X [a]
 multiplex = MultiX
 
@@ -89,22 +75,6 @@ delayE dt e = DelayE (fmap (,dt) e)
 delayE' :: E (a, Double) -> E a
 delayE' = DelayE
 
--- | An event with occurrences explicitly listed.
-occurs :: [(Time, a)] -> E a
-occurs = ConstantE . sortBy (comparing fst)
-
--- | Continually emit snapshots of a signal at a regular interval.
-raster :: X a -> E a
-raster x = snapshot_ x RasterE
-
--- | > rasterize s = trap (atZero s) (raster s)
-rasterize :: X a -> X a
-rasterize s = trap (atZero s) (raster s)
-
--- | Signal carrying the time since start of simulation in seconds.
-time :: X Time
-time = TimeX
-
 -- | An event that occurs once at the beginning of the simulation.
 boot :: E ()
 boot = occurs [(0, ())]
@@ -114,22 +84,6 @@ once :: E a -> E a
 once e = justE out where
   out = snapshot ($) cons e
   cons = trap Just (const Nothing <$ e)
-
--- | > dx / dt
-derivative :: Fractional a => X a -> X a
-derivative = extend f where
-  f s = let dx = at s 0 - at s (-dt') in dx / dt
-  dt' = 0.001
-  dt = realToFrac dt'
-
--- | Integrate a numeric signal using an initial value. The event
--- will reset the sum.
-integral :: Fractional a => a -> E a -> X a -> X a
-integral v0 reset x = mealy v0 f stream where
-  stream = eitherE reset (accum1e (snapshot (,) time (raster x)))
-  f (Left v) _ = v
-  f (Right ((t0,y0),(t1,y1))) s = s + (y1-y0)/(r2f (t1-t0))
-  r2f = realToFrac
 
 -- | Filter out events when the Bool signal is False.
 whenE :: X Bool -> E a -> E a
@@ -142,10 +96,6 @@ accum1e e = justE (snapshot f mem e) where
   f (Just x) y = Just (x,y)
   mem = trap Nothing (Just <$> e)
 
--- | Print out occurrences of events as they happen. Only for debugging.
-debugE :: (a -> String) -> E a -> E a
-debugE toString e = undefined
-
--- | Print out values of a signal at arbitrary times. Only for debugging.
-debugX :: Eq a => (a -> String) -> X a -> X a
-debugX toString sig = undefined
+-- | Periodic event with a specified period in seconds.
+pulse :: Double -> E ()
+pulse period = occurs (map (\i -> (i*period, ())) [0..])

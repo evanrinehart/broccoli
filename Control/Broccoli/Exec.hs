@@ -1,9 +1,10 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
 module Control.Broccoli.Exec (
-  Setup,
-  testE,
-  testX
+  simulate,
+  simulate',
+  debugE,
+  debugX
 ) where
 
 import Control.Applicative
@@ -18,7 +19,6 @@ import qualified Data.Map as M
 import GHC.Prim (Any)
 import Unsafe.Coerce
 
-import Control.Broccoli.Types
 import Control.Broccoli.Eval
 import Control.Broccoli.IVar
 import Control.Broccoli.Dispatch
@@ -28,31 +28,11 @@ import Control.Broccoli.Combinators
 
 -- The justification for why this ought to work goes here.
 
--- | A monad to connect inputs and outputs to a program for simulation.
-newtype Setup a = Setup (Context -> IO a)
-
-instance Monad Setup where
-  return x = Setup (\_ -> return x)
-  (Setup r) >>= f = Setup r' where
-    r' mv = do
-      x <- r mv
-      let Setup r'' = f x
-      r'' mv
-
-instance Applicative Setup where
-  pure = return
-  (<*>) = ap
-
-instance Functor Setup where
-  fmap f (Setup io) = Setup (\mv -> f <$> io mv)
-
 data Context = Context
   { cxDeferIO :: Time -> IO () -> IO ()
   , cxDeferredHookups :: IORef [IO ()]
-  , cxRastActions :: IORef [Time -> IO ()]
   , cxVisitedVars :: IORef (Map Int Any) -- Any = IORef (Time -> a)
   , cxThreads :: IORef [ThreadId]
-  , cxLock :: MVar ()
   , cxEpochIv :: IVar UTCTime }
 
 newContext :: IO Context
@@ -61,30 +41,9 @@ newContext = do
   (deferIO, tid) <- newScheduler epochIv
   visitedRef <- newIORef (M.empty)
   threadsRef <- newIORef [tid]
-  lockMv <- newMVar ()
   hookupsRef <- newIORef []
   rastActions <- newIORef []
-  return (Context deferIO hookupsRef rastActions visitedRef threadsRef lockMv epochIv)
-
--- | Run through an event in real time, executing the IO action on each
--- occurrence. The computation never terminates.
-testE :: (Time -> a -> IO ()) -> E a -> IO ()
-testE action e = do
-  cx <- newContext
-  magicE cx e (flip action)
-  let ref = cxDeferredHookups cx
-  whileM (not <$> listIsEmpty ref) $ do
-    ios <- readIORef ref
-    writeIORef ref []
-    sequence ios
-  epoch <- getCurrentTime
-  writeIVarIO (cxEpochIv cx) epoch
-  hang -- finally cleanup
-
--- | Apply an IO action to arbitrary values of a signal in real time. The
--- computation never terminates.
-testX :: (Time -> a -> IO ()) -> X a -> IO ()
-testX action x = testE action (raster x)
+  return (Context deferIO hookupsRef visitedRef threadsRef epochIv)
 
 -- execute effects to setup runtime handler
 magicE :: Context -> E a -> (a -> Time -> IO ()) -> IO ()
@@ -104,8 +63,7 @@ magicE cx e0 k = case e0 of
     magicE cx e $ \x t -> do
       g <- readIORef ref
       k (cons (g t) x) t
-  InputE ref -> addToList ref k
-  RasterE -> addToList (cxRastActions cx) (k ())
+  InputE hookup -> hookup k
 
 magicDelayE :: Context -> E (a, Double) -> (a -> Time -> IO ()) -> IO ()
 magicDelayE cx e k = magicE cx e $ \(x,dt) t -> do
@@ -168,5 +126,60 @@ getNodeName :: X a -> IO Int
 getNodeName sig = do
   sn <- sig `seq` makeStableName sig
   return (hashStableName sn)
+  
+inputThread :: IVar UTCTime -> IO (Time, i) -> [i -> Time -> IO ()] -> IO ()
+inputThread epochIv getIn hds = do
+  epoch <- readIVarIO epochIv
+  forever $ do
+    (t,v) <- getIn
+    mapM_ (\hd -> hd v t) hds
+
+-- | Run a program in real time with a source of external input and an
+-- output handler. The computation never terminates.
+simulate :: IO a -> (Time -> b -> IO ()) -> (E a -> E b) -> IO ()
+simulate getIn doOut prog = do
+  cx <- newContext
+  inputHandlers <- newIORef []
+  let inE = InputE (addToList inputHandlers)
+  magicE cx (prog inE) (flip doOut)
+  repeatedlyExecuteDeferredHookups cx
+  -- spawn input threads
+  epoch <- getCurrentTime
+  writeIVarIO (cxEpochIv cx) epoch
+  hang -- finally cleanup
+
+-- | Like 'simulate' but lets the input source specify exact timing.
+simulate' :: IO (Time, a)
+          -> (Time -> b -> IO ())
+          -> (E a -> E b)
+          -> IO ()
+simulate' = undefined
+
+
+repeatedlyExecuteDeferredHookups :: Context -> IO ()
+repeatedlyExecuteDeferredHookups cx = do
+  let ref = cxDeferredHookups cx
+  whileM (not <$> listIsEmpty ref) $ do
+    ios <- readIORef ref
+    writeIORef ref []
+    sequence ios
+
+-- bootup checklist (one output)
+-- 1. create a blank context
+-- 2. magicE with output action (populates deferred hookups)
+-- 3. repeatedly execute deferred hookups
+-- 4. spawn raster thread
+-- 5. spawn input threads
+-- 6. install the epoch which will cause the machine to go
+-- 7. go to sleep
+
+
+-- | Print out occurrences of events as they happen. Only for debugging.
+debugE :: (a -> String) -> E a -> E a
+debugE toString e = undefined
+
+-- | Print out values of a signal at arbitrary times. Only for debugging.
+debugX :: (a -> String) -> X a -> X a
+debugX toString sig = undefined
 
 
