@@ -84,7 +84,7 @@ testE action e = do
 -- | Apply an IO action to arbitrary values of a signal in real time. The
 -- computation never terminates.
 testX :: (Time -> a -> IO ()) -> X a -> IO ()
-testX action sig = testE action (snapshot_ RasterE sig)
+testX action x = testE action (raster x)
 
 -- execute effects to setup runtime handler
 magicE :: Context -> E a -> (a -> Time -> IO ()) -> IO ()
@@ -99,18 +99,12 @@ magicE cx e0 k = case e0 of
     magicE cx e1 k
     magicE cx e2 k
   DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e k)
-  SnapshotE e sig -> do
+  SnapshotE cons sig e -> do
     ref <- newMagicVar cx sig
     magicE cx e $ \x t -> do
       g <- readIORef ref
-      k (x, g t) t
+      k (cons (g t) x) t
   InputE ref -> addToList ref k
-  Accum1E x0 e -> do
-    ref <- newIORef x0
-    magicE cx e $ \x' t -> do
-      x <- readIORef ref
-      writeIORef ref x'
-      k (x,x') t
   RasterE -> addToList (cxRastActions cx) (k ())
 
 magicDelayE :: Context -> E (a, Double) -> (a -> Time -> IO ()) -> IO ()
@@ -125,7 +119,7 @@ magicX cx arg k = case arg of
   FmapX f sig -> magicX cx sig (\g t -> k (f . g) t)
   ApplX sig1 sig2 -> error "appl"
   TrapX _ e -> magicE cx e (\x t -> k (const x) t)
-  MultiX sigs -> error "multix"
+  MultiX xs -> error "multix magicX"
   TimeWarpX tmap tmapInv sig -> magicX cx sig $ \g t -> do
     cxDeferIO cx (tmapInv t) (k g (tmap t))
 
@@ -174,3 +168,5 @@ getNodeName :: X a -> IO Int
 getNodeName sig = do
   sn <- sig `seq` makeStableName sig
   return (hashStableName sn)
+
+

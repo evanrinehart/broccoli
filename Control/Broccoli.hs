@@ -17,11 +17,11 @@ module Control.Broccoli (
   delayE,
   snapshot,
   snapshot_,
+  mealy,
   accum,
   edge,
   occurs,
-  mergeE,
-  splitE,
+  eitherE,
   maybeE,
   filterE,
   multiplex,
@@ -29,9 +29,12 @@ module Control.Broccoli (
   timeShift,
   timeWarp,
   timeWarp',
+  derivative,
   delayE',
   voidE,
+  raster,
   rasterize,
+  atZero,
 
   -- * Pure interface
   -- | These computations assume that no external input ever occurs.

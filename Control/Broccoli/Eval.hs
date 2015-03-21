@@ -29,6 +29,9 @@ at = sampleX
 occs :: E a -> [(Time, a)]
 occs = allOccs
 
+-- | The value of a signal at @t = 0@
+atZero :: X a -> a
+atZero = (`at` 0)
 
 -- evaluate a program at a particular time assuming no external stimulus
 sampleX :: X a -> Time -> a
@@ -56,16 +59,11 @@ findOcc arg t test = case arg of
       Nothing -> Just (t1, x1)
       Just (t2, x2) -> Just (occUnion test (t1,x1) (t2,x2))
   DelayE e -> occHay test (map delay (allOccs e)) t
-  SnapshotE e sig -> case findOcc e t test of
+  SnapshotE cons sig e -> case findOcc e t test of
     Nothing -> Nothing
     Just (tOcc, x) -> let g = findPhase sig tOcc (occPhase test)
-                      in Just (tOcc, (x, g tOcc))
+                      in Just (tOcc, cons (g tOcc) x)
   InputE _ -> Nothing
-  Accum1E prim e -> case findOcc e t test of
-    Nothing -> Nothing
-    Just (tOcc,b) -> case findOcc e tOcc (occLose test) of
-      Nothing -> Just (tOcc, (prim, b))
-      Just (_, a) -> Just (tOcc, (a,b))
   RasterE -> Just (occRast test t, ())
 
 findPhase :: X a -> Time -> PhaseTest -> (Time -> a)
@@ -97,10 +95,9 @@ allOccs arg = case arg of
   JustE e -> (catMaybes . map sequenceA) (allOccs e)
   UnionE e1 e2 -> (allOccs e1) ++ (allOccs e2)
   DelayE e -> sortBy (comparing fst) (map delay (allOccs e))
-  SnapshotE e sig -> map f (allOccs e) where
-    f (t, x) = let v = sampleX sig t in (t, (x,v))
+  SnapshotE cons sig e -> map f (allOccs e) where
+    f (t, x) = let v = sampleX sig t in (t, cons v x)
   InputE _ -> []
-  Accum1E prim e -> foldOccs prim (allOccs e)
   RasterE -> map (\i -> (i*period, ())) [0..]
 
 foldOccs :: a -> [(Time, a)] -> [(Time, (a,a))]
@@ -218,7 +215,7 @@ instance Monoid (E a) where
   mempty = never
   mappend = unionE
   
--- | @extract s@ samples @s@ at @t=0@, @duplicate s@ at @t@ is @timeShift t s@
+-- | extract = 'atZero', duplicate @s@ at @t@ is 'timeShift' @t s@
 instance Comonad X where
   extract sig = sig `at` 0
   duplicate sig = f <$> sig <*> TimeX where

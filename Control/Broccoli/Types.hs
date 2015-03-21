@@ -13,9 +13,8 @@ data E a where
   JustE :: E (Maybe a) -> E a
   UnionE :: E a -> E a -> E a
   DelayE :: E (a, Double) -> E a
-  SnapshotE :: forall a b c . a ~ (b,c) => E b -> X c -> E a
+  SnapshotE :: forall a b c . (c -> b -> a) -> X c -> E b -> E a
   InputE :: IORef [Handler a] -> E a
-  Accum1E :: forall a b . a ~ (b,b) => b -> E b -> E a
   RasterE :: a ~ () => E a
 
 -- | @X a@ represents time signals with values of type @a@.
