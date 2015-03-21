@@ -28,7 +28,6 @@ module Control.Broccoli (
   maybeE,
   filterE,
   whenE,
-  multiplex,
   dilate,
   timeShift,
   timeWarp,
@@ -45,6 +44,9 @@ module Control.Broccoli (
   -- * Execution
   simulate,
   simulate',
+  testE,
+  testX,
+  hang,
 
   -- * Debug
   debugX,

@@ -46,11 +46,11 @@ snapshot_ = snapshot const
 
 -- | Slow down a signal by a factor. A factor less than one is a speed-up.
 dilate :: Double -> X a -> X a
-dilate 0 x = error "dilate zero would be infinitely fast"
+dilate 0 x = error "dilate zero"
 dilate rate x = timeWarp (*rate) (/rate) x
 
-multiplex :: [X a] -> X [a]
-multiplex = MultiX
+--multiplex :: [X a] -> X [a]
+--multiplex = MultiX
 
 -- | Occurs when something interesting happens between two successive events.
 edge :: (a -> a -> Maybe b) -> E a -> E b
@@ -98,4 +98,5 @@ accum1e e = justE (snapshot f mem e) where
 
 -- | Periodic event with a specified period in seconds.
 pulse :: Double -> E ()
+pulse 0 = error "pulse zero"
 pulse period = occurs (map (\i -> (i*period, ())) [0..])

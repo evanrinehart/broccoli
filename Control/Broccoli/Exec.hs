@@ -1,11 +1,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
-module Control.Broccoli.Exec (
-  simulate,
-  simulate',
-  debugE,
-  debugX
-) where
+module Control.Broccoli.Exec where
 
 import Control.Applicative
 import Control.Concurrent
@@ -15,6 +10,7 @@ import Data.Time
 import System.Mem.StableName
 import Data.Map (Map)
 import qualified Data.Map as M
+import Control.Exception
 
 import GHC.Prim (Any)
 import Unsafe.Coerce
@@ -29,10 +25,10 @@ import Control.Broccoli.Combinators
 -- The justification for why this ought to work goes here.
 
 data Context = Context
-  { cxDeferIO :: Time -> IO () -> IO ()
+  { cxDeferIO :: [(Time, IO ())] -> IO ()
   , cxDeferredHookups :: IORef [IO ()]
   , cxVisitedVars :: IORef (Map Int Any) -- Any = IORef (Time -> a)
-  , cxThreads :: IORef [ThreadId]
+  , cxDispThread :: ThreadId
   , cxEpochIv :: IVar UTCTime }
 
 newContext :: IO Context
@@ -40,16 +36,14 @@ newContext = do
   epochIv <- newIVar
   (deferIO, tid) <- newScheduler epochIv
   visitedRef <- newIORef (M.empty)
-  threadsRef <- newIORef [tid]
   hookupsRef <- newIORef []
   rastActions <- newIORef []
-  return (Context deferIO hookupsRef visitedRef threadsRef epochIv)
+  return (Context deferIO hookupsRef visitedRef tid epochIv)
 
 -- execute effects to setup runtime handler
 magicE :: Context -> E a -> (a -> Time -> IO ()) -> IO ()
 magicE cx e0 k = case e0 of
-  ConstantE [] -> return ()
-  ConstantE occs' -> mapM_ (\(t,x) -> cxDeferIO cx t (k x t)) occs'
+  ConstantE os -> cxDeferIO cx (map (\(t,x) -> (t, k x t)) os)
   FmapE f e -> magicE cx e (\x t -> k (f x) t)
   JustE e -> magicE cx e $ \x t -> case x of
     Nothing -> return ()
@@ -68,7 +62,7 @@ magicE cx e0 k = case e0 of
 magicDelayE :: Context -> E (a, Double) -> (a -> Time -> IO ()) -> IO ()
 magicDelayE cx e k = magicE cx e $ \(x,dt) t -> do
   let t' = t + dt
-  cxDeferIO cx t' (k x t')
+  cxDeferIO cx [(t', k x t')]
 
 magicX :: Context -> X a -> ((Time -> a) -> Time -> IO ()) -> IO ()
 magicX cx arg k = case arg of
@@ -79,7 +73,7 @@ magicX cx arg k = case arg of
   TrapX _ e -> magicE cx e (\x t -> k (const x) t)
   MultiX xs -> error "multix magicX"
   TimeWarpX tmap tmapInv sig -> magicX cx sig $ \g t -> do
-    cxDeferIO cx (tmapInv t) (k g (tmap t))
+    cxDeferIO cx [(tmapInv t, k g (tmap t))]
 
 -- here we generate a Var which will be updated during the simulation.
 -- we only need to generate one per snapshot, if the program were implemented
@@ -117,6 +111,7 @@ whileM check action = do
   b <- check
   if b then action >> whileM check action else return ()
 
+-- | Does nothing and never completes with any result.
 hang :: IO a
 hang = do
   threadDelay (100 * 10^(6::Int))
@@ -146,14 +141,18 @@ simulate getIn doOut prog = do
   -- spawn input threads
   epoch <- getCurrentTime
   writeIVarIO (cxEpochIv cx) epoch
-  hang -- finally cleanup
+  finally hang (killThread (cxDispThread cx))
+
+cleanup :: Context -> IO ()
+cleanup cx = return ()
+    
 
 -- | Like 'simulate' but lets the input source specify exact timing.
 simulate' :: IO (Time, a)
           -> (Time -> b -> IO ())
           -> (E a -> E b)
           -> IO ()
-simulate' = undefined
+simulate' = error "simulate'"
 
 
 repeatedlyExecuteDeferredHookups :: Context -> IO ()
@@ -182,4 +181,11 @@ debugE toString e = undefined
 debugX :: (a -> String) -> X a -> X a
 debugX toString sig = undefined
 
+-- | Simulate an event and print out events as they occur.
+testE :: (a -> String) -> E a -> IO ()
+testE toString e = simulate hang f (const e) where
+  f t v = putStrLn (show t ++ " " ++ toString v)
 
+-- | Simulate a signal and print out samples at arbitrary times.
+testX :: (a -> String) -> X a -> IO ()
+testX toString x = testE toString (snapshot_ x (pulse 0.05))

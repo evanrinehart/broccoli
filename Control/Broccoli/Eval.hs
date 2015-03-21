@@ -200,11 +200,7 @@ data OccTest = OccTest
   { occHay :: forall a . [(Time, a)] -> Time -> Maybe (Time, a)
   , occUnion :: forall a . (Time, a) -> (Time, a) -> (Time, a)
   , occPhase :: PhaseTest
-  , occLose :: OccTest
-  , occRast :: Time -> Time }
-
-period :: Double
-period = 0.02
+  , occLose :: OccTest }
 
 tieBreakUnionForward :: (Time,a) -> (Time,a) -> (Time,a)
 tieBreakUnionForward  (u,x) (v,y) = if u <= v then (u,x) else (v,y)
@@ -215,7 +211,6 @@ tieBreakUnionBackward (u,x) (v,y) = if v <= u then (v,x) else (u,y)
 occForwardTime :: OccTest
 occForwardTime = OccTest
   { occHay = undefined
-  , occRast = undefined
   , occUnion = tieBreakUnionForward
   , occPhase = phaseMinus
   , occLose = occM }
@@ -223,7 +218,6 @@ occForwardTime = OccTest
 occBackwardTime :: OccTest
 occBackwardTime = OccTest
   { occHay = undefined
-  , occRast = undefined
   , occUnion = tieBreakUnionBackward
   , occPhase = phasePlus
   , occLose = occP }
@@ -233,15 +227,13 @@ occZM = occForwardTime
   { occHay = \hay t -> case span (\(t',_) -> t' <= t) hay of
       ([], _) -> Nothing
       (os, _) -> Just (last os)
-  , occRast = \t -> realToFrac (floor (t / period) :: Integer) * period } 
+  }
 
 occM :: OccTest
 occM = occForwardTime
   { occHay = \hay t -> case span (\(t',_) -> t' < t) hay of
       ([], _) -> Nothing
       (os, _) -> Just (last os)
-  , occRast = \t -> let u = realToFrac (floor (t / period) :: Integer) * period 
-                    in if u == t then u - period else u
   } 
 
 occZP :: OccTest
@@ -249,15 +241,13 @@ occZP = occBackwardTime
   { occHay = \hay t -> case span (\(t',_) -> t' < t) hay of
       (_, []) -> Nothing
       (_, o:_) -> Just o
-  , occRast = \t -> realToFrac (ceiling (t / period) :: Integer) * period } 
+  }
 
 occP :: OccTest
 occP = occBackwardTime
   { occHay = \hay t -> case span (\(t',_) -> t' <= t) hay of
       (_, []) -> Nothing
       (_, o:_) -> Just o
-  , occRast = \t -> let u = realToFrac (ceiling (t / period) :: Integer) * period 
-                    in if u == t then u + period else u
   }
 
 -- phase test: what is the time signal at time t unless a transition occurred
@@ -275,4 +265,15 @@ phasePlus :: PhaseTest
 phasePlus = PhaseTest
   { phaseOcc = occP
   , phaseReverse = phaseMinus }
+
+
+merge :: (a -> a -> Ordering) -> [a] -> [a] -> [a]
+merge comp [] ys = ys
+merge comp xs [] = xs
+merge comp (x:xs) (y:ys) = case comp x y of
+  EQ -> x:y:merge comp xs ys
+  LT -> x:merge comp xs (y:ys)
+  GT -> y:merge comp (x:xs) ys
+
+
 
