@@ -3,6 +3,7 @@ module Control.Broccoli.Combinators where
 
 import Data.Monoid
 import Control.Applicative
+import Numeric
 
 import Control.Broccoli.Eval
 
@@ -28,7 +29,6 @@ filterE p e = justE (fmap (\x -> if p x then Just x else Nothing) e)
 voidE :: E a -> E ()
 voidE e = () <$ e
 
--- | Merge two events into one.
 eitherE :: E a -> E b -> E (Either a b)
 eitherE e1 e2 = (Left <$> e1) <> (Right <$> e2)
 
@@ -42,6 +42,7 @@ snapshot_ :: X a -> E b -> E a
 snapshot_ = snapshot const
 
 -- | Like 'snapshot' but captures the value 'at' the time of the event.
+-- Therefore the input cannot depend on the output.
 snapshot' :: (a -> b -> c) -> X a -> E b -> E c
 snapshot' = SnapshotE Now
 
@@ -118,3 +119,7 @@ debugX sr toString x = liftA2 const x dummy where
   dummy = trap (atZero x) (debugE toString sampler)
   sampler = snapshot_ x (pulse period)
   period = srToPeriod sr
+
+-- | Format time like the debuggers and testbenches.
+showTime :: Time -> String
+showTime t = showFFloat (Just 5) t ""

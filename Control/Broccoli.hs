@@ -53,6 +53,7 @@ module Control.Broccoli (
   -- * Debug
   debugX,
   debugE,
+  showTime
 ) where
 
 import Control.Broccoli.Eval

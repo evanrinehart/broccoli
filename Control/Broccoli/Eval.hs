@@ -151,10 +151,9 @@ findPhase arg t test = case arg of
   TrapX prim e -> case findOcc e t (phaseOcc test) of
     Nothing -> const prim
     Just (_,x) -> const x
-  TimeWarpX g _ x -> case compare (g 0) (g 1) of
-    EQ -> error "bad time warp"
-    LT -> findPhase x (g t) test . g
-    GT -> findPhase x (g t) (phaseReverse test) . g
+  TimeWarpX g _ x -> case warp g of
+    Forward  -> findPhase x (g t) test . g
+    Backward -> findPhase x (g t) (phaseReverse test) . g
 
 findJust :: E (Maybe a) -> Time -> OccTest -> Maybe (Time, a)
 findJust e t test = case findOcc e t test of
@@ -274,10 +273,9 @@ primPhase arg = case arg of
   FmapX f x -> f . primPhase x
   ApplX ff xx -> primPhase ff <*> primPhase xx
   TrapX prim _ -> const prim
-  TimeWarpX g _ x -> case compare (g 0) (g 1) of
-    EQ -> error "bad time warp"
-    LT -> primPhase x . g
-    GT -> finalPhase x . g
+  TimeWarpX g _ x -> case warp g of
+    Forward  -> primPhase x . g
+    Backward -> finalPhase x . g
 
 finalPhase :: X a -> (Time -> a)
 finalPhase arg = case arg of
@@ -288,15 +286,21 @@ finalPhase arg = case arg of
   TrapX prim e -> case occs e of
     [] -> const prim
     os -> const (snd (last os))
-  TimeWarpX g _ x -> case compare (g 0) (g 1) of
-    EQ -> error "bad time warp"
-    LT -> finalPhase x . g
-    GT -> primPhase x . g
+  TimeWarpX g _ x -> case warp g of
+    Forward  -> finalPhase x . g
+    Backward -> primPhase x . g
 
 phaseTestFromBias :: Bias -> PhaseTest
 phaseTestFromBias Now = phasePlus
 phaseTestFromBias NowMinus = phaseMinus
 
-
 srToPeriod :: Int -> Double
 srToPeriod = abs . recip . realToFrac
+
+data WarpDirection = Forward | Backward deriving (Eq, Show)
+
+warp :: (Time -> Time) -> WarpDirection
+warp g = case compare (g 0) (g 1) of
+  LT -> Forward
+  EQ -> error "bad time warp"
+  GT -> Backward

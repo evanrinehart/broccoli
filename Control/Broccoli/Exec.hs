@@ -65,25 +65,40 @@ magicDelayE cx e k = magicE cx e $ \(x,dt) t -> do
   let t' = t + dt
   cxDeferIO cx [(t', k x t')]
 
-magicX :: Context -> X a -> ((Time -> a) -> Time -> IO ()) -> IO ()
+magicX :: Context -> X a -> ((Time -> a, Time -> a) -> Time -> IO ()) -> IO ()
 magicX cx arg k = case arg of
   PureX _ -> return ()
   TimeX -> return ()
-  FmapX f x -> magicX cx x (\g t -> k (f . g) t)
+  FmapX f x -> magicX cx x (\(g1,g2) t -> k (f . g1, f . g2) t)
   ApplX ff xx -> do
-    ffref <- newIORef (primPhase ff)
-    xxref <- newIORef (primPhase xx)
-    magicX cx ff $ \g t -> do
-      writeIORef ffref g
-      foo <- readIORef xxref
-      k (g <*> foo) t
-    magicX cx xx $ \g t -> do
-      writeIORef xxref g
-      foo <- readIORef ffref
-      k (foo <*> g) t
-  TrapX _ e -> magicE cx e (\x t -> k (const x) t)
-  TimeWarpX tmap tmapInv sig -> magicX cx sig $ \g t -> do
-    cxDeferIO cx [(tmapInv t, k g (tmap t))]
+    let f0 = primPhase ff
+    let x0 = primPhase xx
+    ffref <- newIORef (f0,f0)
+    xxref <- newIORef (x0,x0)
+    magicX cx ff $ \(g1, g2) t -> do
+      writeIORef ffref (g1, g2)
+      (h1, h2) <- readIORef xxref
+      k (g1 <*> h1, g2 <*> h2) t
+    magicX cx xx $ \(g1, g2) t -> do
+      writeIORef xxref (g1, g2)
+      (h1, h2) <- readIORef ffref
+      k (h1 <*> g1, h2 <*> g2) t
+  TrapX prim e -> do
+    phaseRef <- newIORef (const prim)
+    magicE cx e $ \x t -> do
+      g1 <- readIORef phaseRef
+      let g2 = const x
+      writeIORef phaseRef g2
+      k (g1, g2) t
+  TimeWarpX tmap tmapInv sig -> magicX cx sig $ \(g1, g2) t -> do
+    let t' = tmapInv t
+    print t'
+    case compare t' t of
+      LT -> hPutStrLn stderr "Warning: an acausal influence was ignored."
+      EQ -> k (g1 . tmap, g2 . tmap) t
+      GT -> case warp tmap of
+        Forward  -> cxDeferIO cx [(t', k (g1 . tmap, g2 . tmap) t')]
+        Backward -> cxDeferIO cx [(t', k (g2 . tmap, g1 . tmap) t')]
 
 newMagicVar :: forall a . Context -> Bias -> X a -> IO (IORef (Time -> a))
 newMagicVar cx bias x = do
@@ -95,7 +110,7 @@ newMagicVar cx bias x = do
       ref <- newIORef phase
       --modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
       modifyIORef (cxVisitedVars cx) ((uid, unsafeCoerce ref :: Any):)
-      let hookup = magicX cx x (\g _ -> writeIORef ref g)
+      let hookup = magicX cx x (\(_,g) _ -> writeIORef ref g)
       case bias of
         NowMinus -> addToList (cxDeferredHookups cx) hookup
         Now -> hookup
