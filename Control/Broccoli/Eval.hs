@@ -352,6 +352,11 @@ prop_justE e = catMaybes (map f (occs e)) == occs (JustE e) where
 prop_unionE :: Eq a => E a -> E a -> Bool
 prop_unionE e1 e2 = merge (comparing fst) (occs e1) (occs e2) == occs (e1 <> e2)
 
+prop_unionE2 :: Bool
+prop_unionE2 = merge (comparing fst) (occs e1) (occs e2) == occs (e1 <> e2) where
+  e1 = occurs [(-1, 'a'), (0,'b'), (1,'c')]
+  e2 = occurs [(0, 'd'), (1,'e'), (2,'f')]
+
 -- not exactly true due to floating point
 {-
 prop_delayE :: Eq a => Double -> E a -> Bool
