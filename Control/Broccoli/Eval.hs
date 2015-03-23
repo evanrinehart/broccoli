@@ -31,7 +31,6 @@ data X a where
   FmapX :: forall a b . (b -> a) -> X b -> X a
   ApplX :: forall a b . X (b -> a) -> X b -> X a
   TrapX :: a -> E a -> X a
-  MultiX :: a ~ [b] => [X b] -> X a
   TimeWarpX :: (Time -> Time) -> (Time -> Time) -> X a -> X a
   --XF :: forall a b . ((Time -> b) -> (Time -> a)) -> X b -> X a
 
@@ -106,7 +105,6 @@ timeOnlyX arg = case arg of
   FmapX _ x -> timeOnlyX x
   ApplX ff xx -> timeOnlyX ff && timeOnlyX xx
   TrapX _ _ -> False
-  MultiX xs -> and (map timeOnlyX xs)
   TimeWarpX _ _ x -> timeOnlyX x
 
 -- | Measure the value of a signal at some time.
@@ -119,7 +117,6 @@ at arg t = case arg of
   TrapX prim e -> case findOcc e t occZM of
     Nothing -> prim
     Just (_,x) -> x
-  MultiX xs -> map (`at` t) xs
   TimeWarpX g _ x -> x `at` (g t)
 
 findOcc :: E a -> Time -> OccTest -> Maybe (Time, a)
@@ -150,8 +147,6 @@ findPhase arg t test = case arg of
   TrapX prim e -> case findOcc e t (phaseOcc test) of
     Nothing -> const prim
     Just (_,x) -> const x
-  MultiX sigs -> let phases = map (\sig -> findPhase sig t test) sigs
-                 in \u -> map ($ u) phases
   TimeWarpX g _ x -> case compare (g 0) (g 1) of
     EQ -> const (x `at` (g 0))
     LT -> findPhase x (g t) test
@@ -189,7 +184,6 @@ unX arg = case arg of
   ApplX _ _ -> Nothing
   TrapX _ e -> Just e
   TimeWarpX _ _ _ -> Nothing
-  MultiX _ -> Nothing
   
 delay :: (Time, (a, Double)) -> (Time, a)
 delay (t, (x, dt)) = (t + dt, x)
@@ -267,6 +261,7 @@ phasePlus = PhaseTest
   , phaseReverse = phaseMinus }
 
 
+-- merge two sorted lists into another sorted list lazily
 merge :: (a -> a -> Ordering) -> [a] -> [a] -> [a]
 merge comp [] ys = ys
 merge comp xs [] = xs

@@ -3,8 +3,8 @@ module Control.Broccoli.Dispatch where
 import Control.Monad
 import Control.Concurrent
 import Control.Concurrent.STM
-import Data.Map (Map)
-import qualified Data.Map as M
+--import Data.Map (Map)
+--import qualified Data.Map as M
 import Data.Time
 import Data.Maybe
 import Data.Ord

@@ -27,18 +27,14 @@ import Control.Broccoli.Combinators
 data Context = Context
   { cxDeferIO :: [(Time, IO ())] -> IO ()
   , cxDeferredHookups :: IORef [IO ()]
-  , cxVisitedVars :: IORef (Map Int Any) -- Any = IORef (Time -> a)
-  , cxDispThread :: ThreadId
-  , cxEpochIv :: IVar UTCTime }
+  , cxVisitedVars :: IORef (Map Int Any)  -- Any = IORef (Time -> a)
+  }
 
-newContext :: IO Context
-newContext = do
-  epochIv <- newIVar
-  (deferIO, tid) <- newScheduler epochIv
-  visitedRef <- newIORef (M.empty)
-  hookupsRef <- newIORef []
-  rastActions <- newIORef []
-  return (Context deferIO hookupsRef visitedRef tid epochIv)
+-- | Does nothing and never completes with any result.
+hang :: IO a
+hang = do
+  threadDelay (100 * 10^(6::Int))
+  hang
 
 -- execute effects to setup runtime handler
 magicE :: Context -> E a -> (a -> Time -> IO ()) -> IO ()
@@ -69,30 +65,17 @@ magicX cx arg k = case arg of
   PureX _ -> return ()
   TimeX -> return ()
   FmapX f sig -> magicX cx sig (\g t -> k (f . g) t)
-  ApplX sig1 sig2 -> error "appl"
+  ApplX sig1 sig2 -> error "magicX ApplX"
   TrapX _ e -> magicE cx e (\x t -> k (const x) t)
-  MultiX xs -> error "multix magicX"
   TimeWarpX tmap tmapInv sig -> magicX cx sig $ \g t -> do
     cxDeferIO cx [(tmapInv t, k g (tmap t))]
 
--- here we generate a Var which will be updated during the simulation.
--- we only need to generate one per snapshot, if the program were implemented
--- as a graph behind the scenes. but it will still work just less efficiently
--- if the variable were copied for every handler that uses the snapshot.
--- every variable would generate a trigger on every input that the snapshot sees.
---
--- actually if we dont cull the number of variables here, then every client of
--- the component will replicate all the internal variables and related triggers
--- to update it, seems like a waste in a large program.
---
--- how do we do it? 
 newMagicVar :: forall a . Context -> X a -> IO (IORef (Time -> a))
 newMagicVar cx sig = do
   uid <- getNodeName sig
   saw <- readIORef (cxVisitedVars cx)
   case M.lookup uid saw of
     Nothing -> do
-      putStrLn ("magic var " ++ show uid)
       let ph0Minus = findPhase sig 0 phaseMinus
       ref <- newIORef (ph0Minus)
       modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
@@ -111,48 +94,32 @@ whileM check action = do
   b <- check
   if b then action >> whileM check action else return ()
 
--- | Does nothing and never completes with any result.
-hang :: IO a
-hang = do
-  threadDelay (100 * 10^(6::Int))
-  hang
-
 getNodeName :: X a -> IO Int
 getNodeName sig = do
   sn <- sig `seq` makeStableName sig
   return (hashStableName sn)
   
-inputThread :: IVar UTCTime -> IO (Time, i) -> [i -> Time -> IO ()] -> IO ()
-inputThread epochIv getIn hds = do
-  epoch <- readIVarIO epochIv
-  forever $ do
-    (t,v) <- getIn
-    mapM_ (\hd -> hd v t) hds
 
 -- | Run a program in real time with a source of external input and an
 -- output handler. The computation never terminates.
 simulate :: IO a -> (Time -> b -> IO ()) -> (E a -> E b) -> IO ()
 simulate getIn doOut prog = do
-  cx <- newContext
-  inputHandlers <- newIORef []
-  let inE = InputE (addToList inputHandlers)
+  epochIv <- newIVar
+  (deferIO, dispThread) <- newScheduler epochIv
+  ref1 <- newIORef []
+  ref2 <- newIORef M.empty
+  let cx = Context deferIO ref1 ref2
+  inputHandlersRef <- newIORef []
+  let inE = InputE (addToList inputHandlersRef)
   magicE cx (prog inE) (flip doOut)
   repeatedlyExecuteDeferredHookups cx
-  -- spawn input threads
+  hds <- readIORef inputHandlersRef
   epoch <- getCurrentTime
-  writeIVarIO (cxEpochIv cx) epoch
-  finally hang (killThread (cxDispThread cx))
-
-cleanup :: Context -> IO ()
-cleanup cx = return ()
-    
-
--- | Like 'simulate' but lets the input source specify exact timing.
-simulate' :: IO (Time, a)
-          -> (Time -> b -> IO ())
-          -> (E a -> E b)
-          -> IO ()
-simulate' = error "simulate'"
+  writeIVarIO epochIv epoch
+  flip finally (killThread dispThread) $ forever $ do
+    v <- getIn
+    t <- getSimulationTime epoch
+    mapM_ (\hd -> hd v t) hds
 
 
 repeatedlyExecuteDeferredHookups :: Context -> IO ()
@@ -181,7 +148,7 @@ debugE toString e = undefined
 debugX :: (a -> String) -> X a -> X a
 debugX toString sig = undefined
 
--- | Simulate an event and print out events as they occur.
+-- | Simulate an event and print out the occurrences as they happen.
 testE :: (a -> String) -> E a -> IO ()
 testE toString e = simulate hang f (const e) where
   f t v = putStrLn (show t ++ " " ++ toString v)

@@ -90,13 +90,19 @@ whenE :: X Bool -> E a -> E a
 whenE x e = justE (snapshot f x e) where
   f b v = if b then Just v else Nothing
 
+-- | Periodic event with a specified period in seconds.
+pulse :: Double -> E ()
+pulse 0 = error "pulse zero"
+pulse period = occurs (map (\i -> (i*period, ())) [0..])
+
+multiplex :: [X a] -> X [a]
+multiplex [] = pure []
+multiplex (x:xs) = liftA2 (:) x (multiplex xs)
+
 accum1e :: E a -> E (a,a)
 accum1e e = justE (snapshot f mem e) where
   f Nothing _ = Nothing
   f (Just x) y = Just (x,y)
   mem = trap Nothing (Just <$> e)
 
--- | Periodic event with a specified period in seconds.
-pulse :: Double -> E ()
-pulse 0 = error "pulse zero"
-pulse period = occurs (map (\i -> (i*period, ())) [0..])
+
