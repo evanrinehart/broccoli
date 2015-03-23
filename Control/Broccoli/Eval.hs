@@ -99,7 +99,7 @@ timeWarp = TimeWarpX
 timeWarp' :: (Time -> Time) -> X a -> X a
 timeWarp' f x = if timeOnlyX x
   then TimeWarpX f undefined x
-  else error "timeWarp': can't handle events. Try timewarp."
+  else error "timeWarp': can't handle events. Try regular timeWarp."
 
 timeOnlyX :: X a -> Bool
 timeOnlyX arg = case arg of
