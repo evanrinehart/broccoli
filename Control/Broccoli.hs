@@ -25,6 +25,7 @@ module Control.Broccoli (
   boot,
   pulse,
   eitherE,
+  pairE,
   maybeE,
   filterE,
   multiplex,
@@ -44,8 +45,8 @@ module Control.Broccoli (
 
   -- * Execution
   simulate,
-  testE,
   testX,
+  testE,
   hang,
 
   -- * Debug

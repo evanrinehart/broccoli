@@ -6,7 +6,6 @@ import Data.Maybe
 import Data.Ord
 import Data.List
 import Control.Applicative
-import Control.Comonad
 
 import Control.Broccoli.Eval
 
@@ -46,15 +45,12 @@ snapshot_ = snapshot const
 
 -- | Slow down a signal by a factor. A factor less than one is a speed-up.
 dilate :: Double -> X a -> X a
-dilate 0 x = error "dilate zero"
-dilate rate x = timeWarp (*rate) (/rate) x
-
---multiplex :: [X a] -> X [a]
---multiplex = MultiX
+dilate 0 _ = error "dilate zero"
+dilate rate x = timeWarp (/rate) (*rate) x
 
 -- | Occurs when something interesting happens between two successive events.
 edge :: (a -> a -> Maybe b) -> E a -> E b
-edge diff e = maybeE (uncurry diff) (accum1e e)
+edge diff e = maybeE (uncurry diff) (pairE e)
 
 -- | Sum over events using an initial state and a state transition function.
 mealy :: s -> (a -> s -> s) -> E a -> X s
@@ -99,8 +95,10 @@ multiplex :: [X a] -> X [a]
 multiplex [] = pure []
 multiplex (x:xs) = liftA2 (:) x (multiplex xs)
 
-accum1e :: E a -> E (a,a)
-accum1e e = justE (snapshot f mem e) where
+-- | Pairs occurrence @n-1@ with occurrence @n@. Nothing happens on the first
+-- occurrence.
+pairE :: E a -> E (a,a)
+pairE e = justE (snapshot f mem e) where
   f Nothing _ = Nothing
   f (Just x) y = Just (x,y)
   mem = trap Nothing (Just <$> e)

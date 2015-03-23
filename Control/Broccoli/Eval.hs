@@ -21,6 +21,7 @@ data E a where
   DelayE :: E (a, Double) -> E a
   SnapshotE :: forall a b c . (c -> b -> a) -> X c -> E b -> E a
   InputE :: ((a -> Time -> IO ()) -> IO ()) -> E a
+  DebugE :: (a -> String) -> E a -> E a
 
 -- | @X a@ represents time signals with values of type @a@.
 -- 
@@ -71,13 +72,10 @@ never = ConstantE []
 unionE :: E a -> E a -> E a
 unionE = UnionE
 
--- | An event with occurrences explicitly listed in ascending order.
+-- | An event with occurrences explicitly specified in ascending order.
 occurs :: [(Time, a)] -> E a
 occurs = ConstantE
 
--- | List of all the occurrences of an event.
-occs :: E a -> [(Time, a)]
-occs = allOccs
 
 -- | > atZero x = x `at` 0
 atZero :: X a -> a
@@ -95,8 +93,8 @@ timeWarp = TimeWarpX
 -- | Like 'timeWarp' but doesn't require an inverse. Doesn't work with events.
 timeWarp' :: (Time -> Time) -> X a -> X a
 timeWarp' f x = if timeOnlyX x
-  then TimeWarpX f id x
-  else error "timeWarp' can't handle events. Try timewarp."
+  then TimeWarpX f undefined x
+  else error "timeWarp': can't handle events. Try timewarp."
 
 timeOnlyX :: X a -> Bool
 timeOnlyX arg = case arg of
@@ -131,16 +129,17 @@ findOcc arg t test = case arg of
     Just (t1, x1) -> case findOcc e1 t1 test of
       Nothing -> Just (t1, x1)
       Just (t2, x2) -> Just (occUnion test (t1,x1) (t2,x2))
-  DelayE e -> occHay test (map delay (allOccs e)) t
+  DelayE e -> occHay test (map delay (occs e)) t
   SnapshotE cons sig e -> case findOcc e t test of
     Nothing -> Nothing
     Just (tOcc, x) -> let g = findPhase sig tOcc (occPhase test)
                       in Just (tOcc, cons (g tOcc) x)
   InputE _ -> Nothing
+  DebugE _ e -> findOcc e t test
 
 findPhase :: X a -> Time -> PhaseTest -> (Time -> a)
 findPhase arg t test = case arg of
-  PureX x -> const x
+  PureX v -> const v
   TimeX -> id
   FmapX f sig -> f . (findPhase sig t test)
   ApplX ff xx -> (findPhase ff t test) <*> (findPhase xx t test)
@@ -148,9 +147,9 @@ findPhase arg t test = case arg of
     Nothing -> const prim
     Just (_,x) -> const x
   TimeWarpX g _ x -> case compare (g 0) (g 1) of
-    EQ -> const (x `at` (g 0))
-    LT -> findPhase x (g t) test
-    GT -> findPhase x (g t) (phaseReverse test)
+    EQ -> error "bad time warp"
+    LT -> findPhase x (g t) test . g
+    GT -> findPhase x (g t) (phaseReverse test) . g
 
 findJust :: E (Maybe a) -> Time -> OccTest -> Maybe (Time, a)
 findJust e t test = case findOcc e t test of
@@ -158,33 +157,25 @@ findJust e t test = case findOcc e t test of
   Just (tOcc, Nothing) -> findJust e tOcc test
   Just (tOcc, Just x) -> Just (tOcc, x)
 
-allOccs :: E a -> [(Time, a)]
-allOccs arg = case arg of
+-- | List of all the occurrences of an event.
+occs :: E a -> [(Time, a)]
+occs arg = case arg of
   ConstantE os -> os
-  FmapE f e -> map (fmap f) (allOccs e)
-  JustE e -> (catMaybes . map sequenceA) (allOccs e)
-  UnionE e1 e2 -> (allOccs e1) ++ (allOccs e2)
-  DelayE e -> sortBy (comparing fst) (map delay (allOccs e))
-  SnapshotE cons x e -> map f (allOccs e) where
+  FmapE f e -> map (fmap f) (occs e)
+  JustE e -> (catMaybes . map sequenceA) (occs e)
+  UnionE e1 e2 -> (occs e1) ++ (occs e2)
+  DelayE e -> sortBy (comparing fst) (map delay (occs e))
+  SnapshotE cons x e -> map f (occs e) where
     f (t, ev) = let g = findPhase x t phaseMinus
                     xv = g t
                 in (t, cons xv ev)
   InputE _ -> []
+  DebugE _ e -> occs e
 
 foldOccs :: a -> [(Time, a)] -> [(Time, (a,a))]
 foldOccs _ [] = []
 foldOccs prev ((t,x):os) = (t,(prev,x)) : foldOccs x os
 
--- cast a discretely changing signal as an event if possible
-unX :: X a -> Maybe (E a)
-unX arg = case arg of
-  PureX _ -> Just mempty
-  TimeX -> Nothing
-  FmapX f x -> fmap (FmapE f) (unX x)
-  ApplX _ _ -> Nothing
-  TrapX _ e -> Just e
-  TimeWarpX _ _ _ -> Nothing
-  
 delay :: (Time, (a, Double)) -> (Time, a)
 delay (t, (x, dt)) = (t + dt, x)
 
@@ -271,4 +262,28 @@ merge comp (x:xs) (y:ys) = case comp x y of
   GT -> y:merge comp (x:xs) ys
 
 
+primPhase :: X a -> (Time -> a)
+primPhase arg = case arg of
+  PureX v -> const v
+  TimeX -> id
+  FmapX f x -> f . primPhase x
+  ApplX ff xx -> primPhase ff <*> primPhase xx
+  TrapX prim _ -> const prim
+  TimeWarpX g _ x -> case compare (g 0) (g 1) of
+    EQ -> error "bad time warp"
+    LT -> primPhase x . g
+    GT -> finalPhase x . g
 
+finalPhase :: X a -> (Time -> a)
+finalPhase arg = case arg of
+  PureX v -> const v
+  TimeX -> id
+  FmapX f x -> f . finalPhase x
+  ApplX ff xx -> finalPhase ff <*> finalPhase xx
+  TrapX prim e -> case occs e of
+    [] -> const prim
+    os -> const (snd (last os))
+  TimeWarpX g _ x -> case compare (g 0) (g 1) of
+    EQ -> error "bad time warp"
+    LT -> finalPhase x . g
+    GT -> primPhase x . g

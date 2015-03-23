@@ -11,6 +11,8 @@ import System.Mem.StableName
 import Data.Map (Map)
 import qualified Data.Map as M
 import Control.Exception
+import Numeric
+import System.IO
 
 import GHC.Prim (Any)
 import Unsafe.Coerce
@@ -30,12 +32,6 @@ data Context = Context
   , cxVisitedVars :: IORef (Map Int Any)  -- Any = IORef (Time -> a)
   }
 
--- | Does nothing and never completes with any result.
-hang :: IO a
-hang = do
-  threadDelay (100 * 10^(6::Int))
-  hang
-
 -- execute effects to setup runtime handler
 magicE :: Context -> E a -> (a -> Time -> IO ()) -> IO ()
 magicE cx e0 k = case e0 of
@@ -54,6 +50,9 @@ magicE cx e0 k = case e0 of
       g <- readIORef ref
       k (cons (g t) x) t
   InputE hookup -> hookup k
+  DebugE toString e -> magicE cx e $ \v t -> do
+    hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
+    k v t
 
 magicDelayE :: Context -> E (a, Double) -> (a -> Time -> IO ()) -> IO ()
 magicDelayE cx e k = magicE cx e $ \(x,dt) t -> do
@@ -64,22 +63,32 @@ magicX :: Context -> X a -> ((Time -> a) -> Time -> IO ()) -> IO ()
 magicX cx arg k = case arg of
   PureX _ -> return ()
   TimeX -> return ()
-  FmapX f sig -> magicX cx sig (\g t -> k (f . g) t)
-  ApplX sig1 sig2 -> error "magicX ApplX"
+  FmapX f x -> magicX cx x (\g t -> k (f . g) t)
+  ApplX ff xx -> do
+    ffref <- newIORef (primPhase ff)
+    xxref <- newIORef (primPhase xx)
+    magicX cx ff $ \g t -> do
+      writeIORef ffref g
+      foo <- readIORef xxref
+      k (g <*> foo) t
+    magicX cx xx $ \g t -> do
+      writeIORef xxref g
+      foo <- readIORef ffref
+      k (foo <*> g) t
   TrapX _ e -> magicE cx e (\x t -> k (const x) t)
   TimeWarpX tmap tmapInv sig -> magicX cx sig $ \g t -> do
     cxDeferIO cx [(tmapInv t, k g (tmap t))]
 
 newMagicVar :: forall a . Context -> X a -> IO (IORef (Time -> a))
-newMagicVar cx sig = do
-  uid <- getNodeName sig
+newMagicVar cx x = do
+  uid <- getNodeName x
   saw <- readIORef (cxVisitedVars cx)
   case M.lookup uid saw of
     Nothing -> do
-      let ph0Minus = findPhase sig 0 phaseMinus
-      ref <- newIORef (ph0Minus)
+      let phase = primPhase x
+      ref <- newIORef phase
       modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
-      addToList (cxDeferredHookups cx) (magicX cx sig (\g _ -> writeIORef ref g))
+      addToList (cxDeferredHookups cx) (magicX cx x (\g _ -> writeIORef ref g))
       return ref
     Just var -> return (unsafeCoerce var :: IORef (Time -> a))
 
@@ -102,8 +111,8 @@ getNodeName sig = do
 
 -- | Run a program in real time with a source of external input and an
 -- output handler. The computation never terminates.
-simulate :: IO a -> (Time -> b -> IO ()) -> (E a -> E b) -> IO ()
-simulate getIn doOut prog = do
+simulate :: (E a -> E b) -> IO a -> (Time -> b -> IO ()) -> IO ()
+simulate prog getIn doOut = do
   epochIv <- newIVar
   (deferIO, dispThread) <- newScheduler epochIv
   ref1 <- newIORef []
@@ -140,19 +149,37 @@ repeatedlyExecuteDeferredHookups cx = do
 -- 7. go to sleep
 
 
--- | Print out occurrences of events as they happen. Only for debugging.
+-- | During a simulation print out occurrences of the event as they happen.
+-- Only for debugging.
 debugE :: (a -> String) -> E a -> E a
-debugE toString e = undefined
+debugE toString e = DebugE toString e
 
--- | Print out values of a signal at arbitrary times. Only for debugging.
-debugX :: (a -> String) -> X a -> X a
-debugX toString sig = undefined
+-- | During a simulation print out values of a signal at the specified sample
+-- rate. Only for debugging.
+debugX :: Int -> (a -> String) -> X a -> X a
+debugX 0 _ _ = error "debugX: sample rate zero"
+debugX sr toString x = liftA2 const x dummy where
+  dummy = trap (atZero x) (debugE toString sampler)
+  sampler = snapshot_ x (pulse period)
+  period = srToPeriod sr
 
 -- | Simulate an event and print out the occurrences as they happen.
 testE :: (a -> String) -> E a -> IO ()
-testE toString e = simulate hang f (const e) where
-  f t v = putStrLn (show t ++ " " ++ toString v)
+testE toString e = simulate (const e) hang f where
+  f t v = putStrLn (showFFloat (Just 5) t " " ++ toString v)
 
--- | Simulate a signal and print out samples at arbitrary times.
-testX :: (a -> String) -> X a -> IO ()
-testX toString x = testE toString (snapshot_ x (pulse 0.05))
+-- | Simulate a signal and print out values at the specified sample rate.
+testX :: Int -> (a -> String) -> X a -> IO ()
+testX 0 _ _ = error "testX: sample rate zero"
+testX sr toString x = testE toString (snapshot_ x (pulse (srToPeriod sr)))
+
+srToPeriod :: Int -> Double
+srToPeriod = abs . recip . realToFrac
+
+-- | Does nothing and never completes with any result. Useful as a dummy
+-- input.
+hang :: IO a
+hang = do
+  threadDelay (100 * 10^(6::Int))
+  hang
+
