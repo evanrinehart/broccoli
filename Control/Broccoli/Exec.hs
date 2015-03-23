@@ -92,7 +92,6 @@ magicX cx arg k = case arg of
       k (g1, g2) t
   TimeWarpX tmap tmapInv sig -> magicX cx sig $ \(g1, g2) t -> do
     let t' = tmapInv t
-    print t'
     case compare t' t of
       LT -> hPutStrLn stderr "Warning: an acausal influence was ignored."
       EQ -> k (g1 . tmap, g2 . tmap) t
