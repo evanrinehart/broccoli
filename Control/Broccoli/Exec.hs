@@ -8,8 +8,8 @@ import Data.IORef
 import Control.Monad
 import Data.Time
 import System.Mem.StableName
-import Data.Map (Map)
-import qualified Data.Map as M
+--import Data.Map (Map)
+--import qualified Data.Map as M
 import Control.Exception
 import Numeric
 import System.IO
@@ -18,7 +18,6 @@ import GHC.Prim (Any)
 import Unsafe.Coerce
 
 import Control.Broccoli.Eval
-import Control.Broccoli.IVar
 import Control.Broccoli.Dispatch
 import Control.Broccoli.Combinators
 
@@ -29,7 +28,8 @@ import Control.Broccoli.Combinators
 data Context = Context
   { cxDeferIO :: [(Time, IO ())] -> IO ()
   , cxDeferredHookups :: IORef [IO ()]
-  , cxVisitedVars :: IORef (Map Int Any)  -- Any = IORef (Time -> a)
+  , cxDebuggers :: IORef [NodeName]
+  , cxVisitedVars :: IORef [(NodeName, Any)]  -- Any = IORef (Time -> a)
   }
 
 -- execute effects to setup runtime handler
@@ -44,15 +44,21 @@ magicE cx e0 k = case e0 of
     magicE cx e1 k
     magicE cx e2 k
   DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e k)
-  SnapshotE cons sig e -> do
-    ref <- newMagicVar cx sig
-    magicE cx e $ \x t -> do
+  SnapshotE bias cons x e -> do
+    ref <- newMagicVar cx bias x
+    magicE cx e $ \v t -> do
       g <- readIORef ref
-      k (cons (g t) x) t
+      k (cons (g t) v) t
   InputE hookup -> hookup k
-  DebugE toString e -> magicE cx e $ \v t -> do
-    hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
-    k v t
+  DebugE toString e -> do
+    let ref = cxDebuggers cx
+    name <- getNodeNameE e0
+    saw <- readIORef ref
+    when (not (name `elem` saw)) $ do
+      addToList ref name
+      magicE cx e $ \v t -> do
+        hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
+        k v t
 
 magicDelayE :: Context -> E (a, Double) -> (a -> Time -> IO ()) -> IO ()
 magicDelayE cx e k = magicE cx e $ \(x,dt) t -> do
@@ -79,16 +85,20 @@ magicX cx arg k = case arg of
   TimeWarpX tmap tmapInv sig -> magicX cx sig $ \g t -> do
     cxDeferIO cx [(tmapInv t, k g (tmap t))]
 
-newMagicVar :: forall a . Context -> X a -> IO (IORef (Time -> a))
-newMagicVar cx x = do
-  uid <- getNodeName x
+newMagicVar :: forall a . Context -> Bias -> X a -> IO (IORef (Time -> a))
+newMagicVar cx bias x = do
+  uid <- getNodeNameX x
   saw <- readIORef (cxVisitedVars cx)
-  case M.lookup uid saw of
+  case lookup uid saw of
     Nothing -> do
       let phase = primPhase x
       ref <- newIORef phase
-      modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
-      addToList (cxDeferredHookups cx) (magicX cx x (\g _ -> writeIORef ref g))
+      --modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
+      modifyIORef (cxVisitedVars cx) ((uid, unsafeCoerce ref :: Any):)
+      let hookup = magicX cx x (\g _ -> writeIORef ref g)
+      case bias of
+        NowMinus -> addToList (cxDeferredHookups cx) hookup
+        Now -> hookup
       return ref
     Just var -> return (unsafeCoerce var :: IORef (Time -> a))
 
@@ -103,28 +113,23 @@ whileM check action = do
   b <- check
   if b then action >> whileM check action else return ()
 
-getNodeName :: X a -> IO Int
-getNodeName sig = do
-  sn <- sig `seq` makeStableName sig
-  return (hashStableName sn)
-  
-
 -- | Run a program in real time with a source of external input and an
 -- output handler. The computation never terminates.
 simulate :: (E a -> E b) -> IO a -> (Time -> b -> IO ()) -> IO ()
 simulate prog getIn doOut = do
-  epochIv <- newIVar
-  (deferIO, dispThread) <- newScheduler epochIv
+  epochMv <- newEmptyMVar
+  (deferIO, dispThread) <- newScheduler epochMv
   ref1 <- newIORef []
-  ref2 <- newIORef M.empty
-  let cx = Context deferIO ref1 ref2
+  ref2 <- newIORef []
+  ref3 <- newIORef []
+  let cx = Context deferIO ref1 ref2 ref3
   inputHandlersRef <- newIORef []
   let inE = InputE (addToList inputHandlersRef)
   magicE cx (prog inE) (flip doOut)
   repeatedlyExecuteDeferredHookups cx
   hds <- readIORef inputHandlersRef
   epoch <- getCurrentTime
-  writeIVarIO epochIv epoch
+  putMVar epochMv epoch
   flip finally (killThread dispThread) $ forever $ do
     v <- getIn
     t <- getSimulationTime epoch
@@ -139,29 +144,6 @@ repeatedlyExecuteDeferredHookups cx = do
     writeIORef ref []
     sequence ios
 
--- bootup checklist (one output)
--- 1. create a blank context
--- 2. magicE with output action (populates deferred hookups)
--- 3. repeatedly execute deferred hookups
--- 4. spawn raster thread
--- 5. spawn input threads
--- 6. install the epoch which will cause the machine to go
--- 7. go to sleep
-
-
--- | During a simulation print out occurrences of the event as they happen.
--- Only for debugging.
-debugE :: (a -> String) -> E a -> E a
-debugE toString e = DebugE toString e
-
--- | During a simulation print out values of a signal at the specified sample
--- rate. Only for debugging.
-debugX :: Int -> (a -> String) -> X a -> X a
-debugX 0 _ _ = error "debugX: sample rate zero"
-debugX sr toString x = liftA2 const x dummy where
-  dummy = trap (atZero x) (debugE toString sampler)
-  sampler = snapshot_ x (pulse period)
-  period = srToPeriod sr
 
 -- | Simulate an event and print out the occurrences as they happen.
 testE :: (a -> String) -> E a -> IO ()
@@ -171,10 +153,7 @@ testE toString e = simulate (const e) hang f where
 -- | Simulate a signal and print out values at the specified sample rate.
 testX :: Int -> (a -> String) -> X a -> IO ()
 testX 0 _ _ = error "testX: sample rate zero"
-testX sr toString x = testE toString (snapshot_ x (pulse (srToPeriod sr)))
-
-srToPeriod :: Int -> Double
-srToPeriod = abs . recip . realToFrac
+testX sr toString x = testE toString (snapshot' const x (pulse (srToPeriod sr)))
 
 -- | Does nothing and never completes with any result. Useful as a dummy
 -- input.
@@ -183,3 +162,22 @@ hang = do
   threadDelay (100 * 10^(6::Int))
   hang
 
+
+
+getNodeNameX :: X a -> IO NodeName
+getNodeNameX x = do
+  sn <- x `seq` makeStableName x
+  return (fromStableName sn)
+
+getNodeNameE :: E a -> IO NodeName
+getNodeNameE e = do
+  sn <- e `seq` makeStableName e
+  return (fromStableName sn)
+
+data NodeName = NodeName (StableName Any) deriving (Eq)
+
+instance Show NodeName where
+  show (NodeName sn) = show (hashStableName sn)
+
+fromStableName :: StableName a -> NodeName
+fromStableName sn = NodeName (unsafeCoerce sn)

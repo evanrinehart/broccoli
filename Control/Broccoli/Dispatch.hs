@@ -10,8 +10,6 @@ import Data.Maybe
 import Data.Ord
 
 import Control.Broccoli.Eval
-import Control.Broccoli.IVar
-
 
 -- so there is one static dispatcher. its like got a [(Time, IO ())]
 -- when you encounter a ConstantE you schedule all the events with all the
@@ -36,12 +34,12 @@ import Control.Broccoli.IVar
 -- 
 -- but for new we can just put everything in the same infinite list.
 
-newScheduler :: IVar UTCTime -> IO ([(Time, IO ())] -> IO (), ThreadId)
-newScheduler epochIv = do
+newScheduler :: MVar UTCTime -> IO ([(Time, IO ())] -> IO (), ThreadId)
+newScheduler epochMv = do
   --tv <- newTVarIO M.empty
   tv <- newTVarIO []
   wake <- newTChanIO
-  tid <- forkIO (dispatcher epochIv tv wake)
+  tid <- forkIO (dispatcher epochMv tv wake)
   return (schedule tv wake, tid)
 
 schedule :: TVar [(Time, IO ())] -> TChan () -> [(Time, IO ())] -> IO ()
@@ -67,12 +65,12 @@ schedule tv wake timeActions = do
 -- in the program, if they happen to occur at the same time. raster effects
 -- happen after all those, in the order rasterizers were specified in the
 -- program.
-dispatcher :: IVar UTCTime
+dispatcher :: MVar UTCTime
            -> TVar [(Time, IO ())] -- -> TVar (Map Time [IO ()])
            -> TChan ()
            -> IO ()
-dispatcher epochIv tv wake = do
-  epoch <- readIVarIO epochIv
+dispatcher epochMv tv wake = do
+  epoch <- takeMVar epochMv
   forever $ do
     now <- getSimulationTime epoch
     (nextWake, ios) <- atomically $ do

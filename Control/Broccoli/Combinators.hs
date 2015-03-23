@@ -2,9 +2,6 @@
 module Control.Broccoli.Combinators where
 
 import Data.Monoid
-import Data.Maybe
-import Data.Ord
-import Data.List
 import Control.Applicative
 
 import Control.Broccoli.Eval
@@ -15,15 +12,15 @@ import Control.Broccoli.Eval
 trap :: a -> E a -> X a
 trap = TrapX
 
--- | Filter out events with the value of Nothing.
+-- | Filter out events with the value of @Nothing@.
 justE :: E (Maybe a) -> E a
 justE = JustE
 
--- | Filter out events using a Maybe function.
+-- | Filter out events using a @Maybe@ function.
 maybeE :: (a -> Maybe b) -> E a -> E b
 maybeE f e = justE (fmap f e)
 
--- | Filter out events using a Bool function.
+-- | Filter out events using a @Bool@ function.
 filterE :: (a -> Bool) -> E a -> E a
 filterE p e = justE (fmap (\x -> if p x then Just x else Nothing) e)
 
@@ -35,13 +32,18 @@ voidE e = () <$ e
 eitherE :: E a -> E b -> E (Either a b)
 eitherE e1 e2 = (Left <$> e1) <> (Right <$> e2)
 
--- | An event which gets the value of a signal when another event occurs.
+-- | When the event occurs the value of the signal immediately before that
+-- time will be captured. Therefore the output can feed back into the input.
 snapshot :: (a -> b -> c) -> X a -> E b -> E c
-snapshot = SnapshotE 
+snapshot = SnapshotE NowMinus
 
 -- | Like 'snapshot' but ignores the original event's payload.
 snapshot_ :: X a -> E b -> E a
 snapshot_ = snapshot const
+
+-- | Like 'snapshot' but captures the value 'at' the time of the event.
+snapshot' :: (a -> b -> c) -> X a -> E b -> E c
+snapshot' = SnapshotE Now
 
 -- | Slow down a signal by a factor. A factor less than one is a speed-up.
 dilate :: Double -> X a -> X a
@@ -81,7 +83,7 @@ once e = justE out where
   out = snapshot ($) cons e
   cons = trap Just (const Nothing <$ e)
 
--- | Filter out events when the Bool signal is False.
+-- | Filter out events when the @Bool@ signal is @False@.
 whenE :: X Bool -> E a -> E a
 whenE x e = justE (snapshot f x e) where
   f b v = if b then Just v else Nothing
@@ -103,4 +105,16 @@ pairE e = justE (snapshot f mem e) where
   f (Just x) y = Just (x,y)
   mem = trap Nothing (Just <$> e)
 
+-- | During a simulation print out occurrences of the event as they happen.
+-- Only for debugging.
+debugE :: (a -> String) -> E a -> E a
+debugE toString e = DebugE toString e
 
+-- | During a simulation print out values of a signal at the specified sample
+-- rate. Only for debugging.
+debugX :: Int -> (a -> String) -> X a -> X a
+debugX 0 _ _ = error "debugX: sample rate zero"
+debugX sr toString x = liftA2 const x dummy where
+  dummy = trap (atZero x) (debugE toString sampler)
+  sampler = snapshot_ x (pulse period)
+  period = srToPeriod sr

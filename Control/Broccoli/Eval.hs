@@ -19,7 +19,7 @@ data E a where
   JustE :: E (Maybe a) -> E a
   UnionE :: E a -> E a -> E a
   DelayE :: E (a, Double) -> E a
-  SnapshotE :: forall a b c . (c -> b -> a) -> X c -> E b -> E a
+  SnapshotE :: forall a b c . Bias -> (c -> b -> a) -> X c -> E b -> E a
   InputE :: ((a -> Time -> IO ()) -> IO ()) -> E a
   DebugE :: (a -> String) -> E a -> E a
 
@@ -40,6 +40,12 @@ data X a where
 type Time = Double
 type Handler a = a -> Time -> IO ()
 
+data Bias = Now | NowMinus deriving (Eq, Ord, Show, Read)
+
+toggleBias :: Bias -> Bias
+toggleBias Now = NowMinus
+toggleBias NowMinus = Now
+
 instance Functor E where
   fmap f e = FmapE f e
 
@@ -55,12 +61,12 @@ instance Monoid (E a) where
   mempty = never
   mappend = unionE
   
--- | extract = 'atZero', duplicate @s@ at @t@ is 'timeShift' @t s@
+-- | extract = 'atZero', duplicate @x@ at @t@ is 'timeShift' @t x@
 instance Comonad X where
   extract = atZero
   duplicate x = fmap (\t -> timeShift t x) time
 
--- | Signal carrying the time since start of simulation in seconds.
+-- | Seconds since start of simulation.
 time :: X Time
 time = TimeX
 
@@ -75,7 +81,6 @@ unionE = UnionE
 -- | An event with occurrences explicitly specified in ascending order.
 occurs :: [(Time, a)] -> E a
 occurs = ConstantE
-
 
 -- | > atZero x = x `at` 0
 atZero :: X a -> a
@@ -130,9 +135,9 @@ findOcc arg t test = case arg of
       Nothing -> Just (t1, x1)
       Just (t2, x2) -> Just (occUnion test (t1,x1) (t2,x2))
   DelayE e -> occHay test (map delay (occs e)) t
-  SnapshotE cons sig e -> case findOcc e t test of
+  SnapshotE bias cons sig e -> case findOcc e t test of
     Nothing -> Nothing
-    Just (tOcc, x) -> let g = findPhase sig tOcc (occPhase test)
+    Just (tOcc, x) -> let g = findPhase sig tOcc (occPhase test bias)
                       in Just (tOcc, cons (g tOcc) x)
   InputE _ -> Nothing
   DebugE _ e -> findOcc e t test
@@ -165,8 +170,8 @@ occs arg = case arg of
   JustE e -> (catMaybes . map sequenceA) (occs e)
   UnionE e1 e2 -> (occs e1) ++ (occs e2)
   DelayE e -> sortBy (comparing fst) (map delay (occs e))
-  SnapshotE cons x e -> map f (occs e) where
-    f (t, ev) = let g = findPhase x t phaseMinus
+  SnapshotE bias cons x e -> map f (occs e) where
+    f (t, ev) = let g = findPhase x t (phaseTestFromBias bias)
                     xv = g t
                 in (t, cons xv ev)
   InputE _ -> []
@@ -184,7 +189,7 @@ delay (t, (x, dt)) = (t + dt, x)
 data OccTest = OccTest
   { occHay :: forall a . [(Time, a)] -> Time -> Maybe (Time, a)
   , occUnion :: forall a . (Time, a) -> (Time, a) -> (Time, a)
-  , occPhase :: PhaseTest
+  , occPhase :: Bias -> PhaseTest
   , occLose :: OccTest }
 
 tieBreakUnionForward :: (Time,a) -> (Time,a) -> (Time,a)
@@ -197,14 +202,14 @@ occForwardTime :: OccTest
 occForwardTime = OccTest
   { occHay = undefined
   , occUnion = tieBreakUnionForward
-  , occPhase = phaseMinus
+  , occPhase = phaseTestFromBias
   , occLose = occM }
 
 occBackwardTime :: OccTest
 occBackwardTime = OccTest
   { occHay = undefined
   , occUnion = tieBreakUnionBackward
-  , occPhase = phasePlus
+  , occPhase = phaseTestFromBias . toggleBias
   , occLose = occP }
 
 occZM :: OccTest
@@ -254,10 +259,10 @@ phasePlus = PhaseTest
 
 -- merge two sorted lists into another sorted list lazily
 merge :: (a -> a -> Ordering) -> [a] -> [a] -> [a]
-merge comp [] ys = ys
-merge comp xs [] = xs
+merge _ [] ys = ys
+merge _ xs [] = xs
 merge comp (x:xs) (y:ys) = case comp x y of
-  EQ -> x:y:merge comp xs ys
+  EQ -> x:merge comp xs (y:ys)
   LT -> x:merge comp xs (y:ys)
   GT -> y:merge comp (x:xs) ys
 
@@ -287,3 +292,11 @@ finalPhase arg = case arg of
     EQ -> error "bad time warp"
     LT -> finalPhase x . g
     GT -> primPhase x . g
+
+phaseTestFromBias :: Bias -> PhaseTest
+phaseTestFromBias Now = phasePlus
+phaseTestFromBias NowMinus = phaseMinus
+
+
+srToPeriod :: Int -> Double
+srToPeriod = abs . recip . realToFrac
