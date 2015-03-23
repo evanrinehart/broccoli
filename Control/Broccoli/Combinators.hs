@@ -92,11 +92,18 @@ whenE x e = justE (snapshot f x e) where
 -- | Periodic event with a specified period in seconds.
 pulse :: Double -> E ()
 pulse 0 = error "pulse zero"
-pulse period = occurs (map (\i -> (i*period, ())) [0..])
+pulse period = occurs (map (\i -> (i*(abs period), ())) [0..])
 
 multiplex :: [X a] -> X [a]
 multiplex [] = pure []
 multiplex (x:xs) = liftA2 (:) x (multiplex xs)
+
+-- | Noisy signal in the range @[0, 1)@.
+noise :: X Double
+noise = f <$> time where
+  b = 123456789
+  f t = fract (cos(23.14069263277926 * t + 2.665144142690225) * b)
+  fract x = abs (snd (properFraction x))
 
 -- | Pairs occurrence @n-1@ with occurrence @n@. Nothing happens on the first
 -- occurrence.

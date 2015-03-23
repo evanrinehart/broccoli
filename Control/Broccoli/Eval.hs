@@ -1,5 +1,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TupleSections #-}
 module Control.Broccoli.Eval where
 
 import Control.Applicative
@@ -9,6 +10,8 @@ import Data.Monoid
 import Data.Maybe
 import Data.Traversable
 import Control.Comonad
+import Test.QuickCheck
+import Test.QuickCheck.Function
 
 -- | @E a@ represents events with values of type @a@.
 -- 
@@ -167,12 +170,15 @@ occs arg = case arg of
   ConstantE os -> os
   FmapE f e -> map (fmap f) (occs e)
   JustE e -> (catMaybes . map sequenceA) (occs e)
-  UnionE e1 e2 -> (occs e1) ++ (occs e2)
+  UnionE e1 e2 -> merge (comparing fst) (occs e1) (occs e2)
   DelayE e -> sortBy (comparing fst) (map delay (occs e))
   SnapshotE bias cons x e -> map f (occs e) where
-    f (t, ev) = let g = findPhase x t (phaseTestFromBias bias)
-                    xv = g t
-                in (t, cons xv ev)
+    f (t, ev) = case bias of
+      Now -> (t, cons (x `at` t) ev)
+      NowMinus ->
+        let g = findPhase x t phaseMinus in
+        let xv = g t in
+        (t, cons xv ev)
   InputE _ -> []
   DebugE _ e -> occs e
 
@@ -291,7 +297,7 @@ finalPhase arg = case arg of
     Backward -> primPhase x . g
 
 phaseTestFromBias :: Bias -> PhaseTest
-phaseTestFromBias Now = phasePlus
+phaseTestFromBias Now = phaseMinus { phaseOcc = occZM }
 phaseTestFromBias NowMinus = phaseMinus
 
 srToPeriod :: Int -> Double
@@ -304,3 +310,132 @@ warp g = case compare (g 0) (g 1) of
   LT -> Forward
   EQ -> error "bad time warp"
   GT -> Backward
+
+
+
+{-
+ -
+data E a where
+  ConstantE :: [(Time, a)] -> E a
+  FmapE :: forall a b . (b -> a) -> E b -> E a
+  JustE :: E (Maybe a) -> E a
+  UnionE :: E a -> E a -> E a
+  DelayE :: E (a, Double) -> E a
+  SnapshotE :: forall a b c . Bias -> (c -> b -> a) -> X c -> E b -> E a
+  InputE :: ((a -> Time -> IO ()) -> IO ()) -> E a
+  DebugE :: (a -> String) -> E a -> E a
+
+-- | @X a@ represents time signals with values of type @a@.
+-- 
+-- > X a = Time -> a
+data X a where
+  PureX :: a -> X a
+  TimeX :: a ~ Time => X a
+  FmapX :: forall a b . (b -> a) -> X b -> X a
+  ApplX :: forall a b . X (b -> a) -> X b -> X a
+  TrapX :: a -> E a -> X a
+  TimeWarpX :: (Time -> Time) -> (Time -> Time) -> X a -> X a
+  --XF :: forall a b . ((Time -> b) -> (Time -> a)) -> X b -> X a
+-}
+
+prop_occurs :: Eq a => [(Time,a)] -> Bool
+prop_occurs os = occs (occurs os) == os
+
+prop_fmap :: Eq b => Fun a b -> E a -> Bool
+prop_fmap (Fun _ f) e = occs (f <$> e) == map (fmap f) (occs e)
+
+prop_justE :: Eq a => E (Maybe a) -> Bool
+prop_justE e = catMaybes (map f (occs e)) == occs (JustE e) where
+  f (t, Nothing) = Nothing
+  f (t, Just v) = Just (t,v)
+
+prop_unionE :: Eq a => E a -> E a -> Bool
+prop_unionE e1 e2 = merge (comparing fst) (occs e1) (occs e2) == occs (e1 <> e2)
+
+-- not exactly true due to floating point
+{-
+prop_delayE :: Eq a => Double -> E a -> Bool
+prop_delayE delta e = all id (zipWith f (occs e) (occs e')) where
+  f (t1,v1) (t2,v2) = t2 - t1 == delta && v1 == v2
+  e' = DelayE (fmap (,delta) e)
+-}
+
+prop_snapshot1 :: Eq a => X a -> E a -> Bool
+prop_snapshot1 x e = occs (SnapshotE Now (,) x e) == fmap f (occs e) where
+  f (t, v) = (t, (x `at` t, v))
+
+prop_snapshot2 :: Bool
+prop_snapshot2 = occs (SnapshotE Now (,) x e) == fmap f (occs e) where
+  e = occurs [(0, 'a'), (1, 'b'), (2, 'c')]
+  x = TrapX 'z' (occurs [(0,'d'), (1,'e'), (2,'f')])
+  f (t, v) = (t, (x `at` t, v))
+
+prop_snapshot3 :: Bool
+prop_snapshot3 = occs (SnapshotE NowMinus (,) x e) == ans where
+  e = occurs [(0, 'a'), (1, 'b'), (2, 'c')]
+  x = TrapX 'z' (occurs [(0,'d'), (1,'e'), (2,'f')])
+  f (t, v) = (t, (x `at` t, v))
+  ans = [(0, ('z','a')), (1, ('d','b')), (2, ('e','c'))]
+
+prop_snapshot4 :: Bool
+prop_snapshot4 = occs (SnapshotE Now (,) x e) == ans where
+  e = occurs [(-1, 'a'), (0, 'b'), (1, 'c')]
+  x = TimeWarpX negate negate (TrapX 'z' (occurs [(-1,'d'), (0,'e'), (1,'f')]))
+  f (t, v) = (t, (x `at` t, v))
+  ans = [(-1, ('f','a')), (0, ('e','b')), (1, ('d','c'))]
+
+prop_snapshot5 :: Bool
+prop_snapshot5 = occs (SnapshotE NowMinus (,) x e) == ans where
+  e = occurs [(-1, 'a'), (0, 'b'), (1, 'c')]
+  x = TimeWarpX negate negate (TrapX 'z' (occurs [(-1,'d'), (0,'e'), (1,'f')]))
+  f (t, v) = (t, (x `at` t, v))
+  ans = [(-1, ('z','a')), (0, ('f','b')), (1, ('e','c'))]
+
+prop_warp1 :: Eq a => Time -> X a -> Bool
+prop_warp1 t x = (TimeWarpX f undefined x) `at` t == x `at` (f t) where
+  f u = u**3
+
+prop_warp2 :: Eq a => Time -> a -> E a -> Bool
+prop_warp2 t v0 e = (TimeWarpX f undefined x) `at` t == x `at` (f t) where
+  x = TrapX v0 e
+  f u = -u**3
+
+prop_applX :: Eq b => Time -> X (Fun Int b) -> X Int -> Bool
+prop_applX t ff xx = (liftA2 app ff xx) `at` t == app (ff `at` t) (xx `at` t) where
+  app (Fun _ f) x = f x
+
+
+instance Show a => Show (E a) where
+  show e = "occurs " ++ show (occs e)
+
+instance Show (X a) where
+  show arg = case arg of
+    PureX _ -> "PureX ?"
+    TimeX -> "TimeX"
+    FmapX _ _ -> "FmapX ? ?"
+    ApplX ff xx -> "ApplX ? ?"
+    TrapX prim e -> "TrapX ? ?"
+    TimeWarpX g gInv x -> "TimeWarpX ? ? ?"
+    
+
+instance Arbitrary a => Arbitrary (E a) where
+  arbitrary = (occurs . sortBy (comparing fst)) <$> listOf o where
+    o = do
+      t <- choose (-100, 100)
+      v <- arbitrary
+      return (t, v)
+
+instance Arbitrary a => Arbitrary (X a) where
+  arbitrary = oneof [boringGen, trapGen]
+
+boringGen :: Arbitrary a => Gen (X a)
+boringGen = do
+  vs <- listOf1 arbitrary
+  let l = length vs
+  return $ (\t -> vs !! (floor t `mod` l)) <$> TimeX
+
+trapGen :: Arbitrary a => Gen (X a)
+trapGen = do
+  e <- arbitrary
+  v0 <- arbitrary
+  return (TrapX v0 e)
