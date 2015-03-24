@@ -13,6 +13,7 @@ import System.Mem.StableName
 import Control.Exception
 import Numeric
 import System.IO
+import Data.Maybe
 
 import GHC.Prim (Any)
 import Unsafe.Coerce
@@ -104,14 +105,21 @@ magicX cx arg wi k = case arg of
       let t' = wi 0
       let os = reverse . takeWhile ((<= t') . fst) $ occs e
       historyRef <- newIORef os
+      valueRef <- newIORef (fromMaybe prim (snd <$> listToMaybe os))
       magicE cx e wi $ \x t -> do
+        vPrev <- readIORef valueRef
         modifyIORef historyRef (drop 1)
         os' <- readIORef historyRef
+        writeIORef valueRef (fromMaybe prim (snd <$> listToMaybe os'))
         case os' of
-          [] -> k (const prim) t
-          (_,v):_ -> k (const v) t
+          [] -> k (patch (const prim) vPrev (wi t)) t
+          (_,v):_ -> k (patch (const v) vPrev (wi t)) t
   TimeWarpX tmap tmapInv x -> magicX cx x (wi . tmapInv) $ \g t -> do
     k (g . tmap) t
+
+patch :: (Time -> a) -> a -> Time -> (Time -> a)
+patch f v0 cutoff t | t == cutoff = v0
+                    | otherwise = f t
 
 newMagicVar :: forall a . Context
             -> Bias
