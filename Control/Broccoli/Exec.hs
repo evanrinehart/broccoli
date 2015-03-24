@@ -18,8 +18,6 @@ import Data.Maybe
 import GHC.Prim (Any)
 import Unsafe.Coerce
 
-import Debug.Trace
-
 import Control.Broccoli.Eval
 import Control.Broccoli.Dispatch
 import Control.Broccoli.Combinators
@@ -110,7 +108,7 @@ magicX cx arg w wi k = case arg of
       let os = reverse . takeWhile ((<= t') . fst) $ occs e
       historyRef <- newIORef os
       valueRef <- newIORef (fromMaybe prim (snd <$> listToMaybe os))
-      magicE cx e w wi $ \x t -> do
+      magicE cx e w wi $ \_ t -> do
         vPrev <- readIORef valueRef
         modifyIORef historyRef (drop 1)
         os' <- readIORef historyRef
