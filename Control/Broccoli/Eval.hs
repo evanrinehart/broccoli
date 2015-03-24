@@ -59,6 +59,10 @@ instance Applicative X where
   pure x = PureX x
   ff <*> xx = ApplX ff xx
 
+instance Monoid a => Monoid (X a) where
+  mempty = pure mempty
+  mappend x1 x2 = liftA2 mappend x1 x2
+
 -- | mempty = 'never', mappend = 'unionE'
 instance Monoid (E a) where
   mempty = never
