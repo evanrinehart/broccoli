@@ -410,6 +410,7 @@ prop_applX t ff xx = (liftA2 app ff xx) `at` t == app (ff `at` t) (xx `at` t) wh
 instance Show a => Show (E a) where
   show e = "occurs " ++ show (occs e)
 
+{-
 instance Show (X a) where
   show arg = case arg of
     PureX _ -> "PureX ?"
@@ -418,6 +419,7 @@ instance Show (X a) where
     ApplX _ _ -> "ApplX ? ?"
     TrapX _ _ -> "TrapX ? ?"
     TimeWarpX _ _ _ -> "TimeWarpX ? ? ?"
+-}
     
 
 instance Arbitrary a => Arbitrary (E a) where
