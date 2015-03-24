@@ -13,19 +13,15 @@ import Control.Broccoli.Eval
 trap :: a -> E a -> X a
 trap = TrapX
 
--- | Filter out events with the value of @Nothing@.
 justE :: E (Maybe a) -> E a
 justE = JustE
 
--- | Filter out events using a @Maybe@ function.
 maybeE :: (a -> Maybe b) -> E a -> E b
 maybeE f e = justE (fmap f e)
 
--- | Filter out events using a @Bool@ function.
 filterE :: (a -> Bool) -> E a -> E a
 filterE p e = justE (fmap (\x -> if p x then Just x else Nothing) e)
 
--- | Forget the event values.
 voidE :: E a -> E ()
 voidE e = () <$ e
 
