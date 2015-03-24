@@ -23,7 +23,7 @@ data E a where
   UnionE :: E a -> E a -> E a
   DelayE :: E (a, Double) -> E a
   SnapshotE :: forall a b c . Bias -> (c -> b -> a) -> X c -> E b -> E a
-  InputE :: ((a -> Time -> IO ()) -> IO ()) -> E a
+  InputE :: ((Time -> Time) -> (a -> Time -> IO ()) -> IO ()) -> E a
   DebugE :: (a -> String) -> E a -> E a
 
 -- | @X a@ represents time signals with values of type @a@.
@@ -346,7 +346,7 @@ prop_fmap (Fun _ f) e = occs (f <$> e) == map (fmap f) (occs e)
 
 prop_justE :: Eq a => E (Maybe a) -> Bool
 prop_justE e = catMaybes (map f (occs e)) == occs (JustE e) where
-  f (t, Nothing) = Nothing
+  f (_, Nothing) = Nothing
   f (t, Just v) = Just (t,v)
 
 prop_unionE :: Eq a => E a -> E a -> Bool
@@ -379,21 +379,18 @@ prop_snapshot3 :: Bool
 prop_snapshot3 = occs (SnapshotE NowMinus (,) x e) == ans where
   e = occurs [(0, 'a'), (1, 'b'), (2, 'c')]
   x = TrapX 'z' (occurs [(0,'d'), (1,'e'), (2,'f')])
-  f (t, v) = (t, (x `at` t, v))
   ans = [(0, ('z','a')), (1, ('d','b')), (2, ('e','c'))]
 
 prop_snapshot4 :: Bool
 prop_snapshot4 = occs (SnapshotE Now (,) x e) == ans where
   e = occurs [(-1, 'a'), (0, 'b'), (1, 'c')]
   x = TimeWarpX negate negate (TrapX 'z' (occurs [(-1,'d'), (0,'e'), (1,'f')]))
-  f (t, v) = (t, (x `at` t, v))
   ans = [(-1, ('f','a')), (0, ('e','b')), (1, ('d','c'))]
 
 prop_snapshot5 :: Bool
 prop_snapshot5 = occs (SnapshotE NowMinus (,) x e) == ans where
   e = occurs [(-1, 'a'), (0, 'b'), (1, 'c')]
   x = TimeWarpX negate negate (TrapX 'z' (occurs [(-1,'d'), (0,'e'), (1,'f')]))
-  f (t, v) = (t, (x `at` t, v))
   ans = [(-1, ('z','a')), (0, ('f','b')), (1, ('e','c'))]
 
 prop_warp1 :: Eq a => Time -> X a -> Bool
@@ -418,9 +415,9 @@ instance Show (X a) where
     PureX _ -> "PureX ?"
     TimeX -> "TimeX"
     FmapX _ _ -> "FmapX ? ?"
-    ApplX ff xx -> "ApplX ? ?"
-    TrapX prim e -> "TrapX ? ?"
-    TimeWarpX g gInv x -> "TimeWarpX ? ? ?"
+    ApplX _ _ -> "ApplX ? ?"
+    TrapX _ _ -> "TrapX ? ?"
+    TimeWarpX _ _ _ -> "TimeWarpX ? ? ?"
     
 
 instance Arbitrary a => Arbitrary (E a) where

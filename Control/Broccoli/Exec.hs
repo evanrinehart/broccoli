@@ -33,74 +33,92 @@ data Context = Context
   }
 
 -- execute effects to setup runtime handler
-magicE :: Context -> E a -> (a -> Time -> IO ()) -> IO ()
-magicE cx e0 k = case e0 of
-  ConstantE os -> cxDeferIO cx (map (\(t,x) -> (t, k x t)) os)
-  FmapE f e -> magicE cx e (\x t -> k (f x) t)
-  JustE e -> magicE cx e $ \x t -> case x of
+magicE :: Context
+       -> E a
+       -> (Time -> Time)
+       -> (a -> Time -> IO ())
+       -> IO ()
+magicE cx e0 wi k = case e0 of
+  ConstantE os -> case compare (wi 0) (wi 1) of
+    EQ -> error "bad time warp"
+    LT -> cxDeferIO cx (map (\(t,x) -> ((wi t), k x (wi t))) os)
+    GT -> cxDeferIO cx (map (\(t,x) -> ((wi t), k x (wi t))) (reverse os))
+  FmapE f e -> magicE cx e wi (\x t -> k (f x) t)
+  JustE e -> magicE cx e wi $ \x t -> case x of
     Nothing -> return ()
     Just y -> k y t
   UnionE e1 e2 -> do
-    magicE cx e1 k
-    magicE cx e2 k
-  DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e k)
+    magicE cx e1 wi k
+    magicE cx e2 wi k
+  DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e wi k)
   SnapshotE bias cons x e -> do
-    ref <- newMagicVar cx bias x
-    magicE cx e $ \v t -> do
+    ref <- newMagicVar cx bias x wi
+    magicE cx e wi $ \v t -> do
       g <- readIORef ref
       k (cons (g t) v) t
-  InputE hookup -> hookup k
+  InputE hookup -> hookup wi k
   DebugE toString e -> do
     let ref = cxDebuggers cx
     name <- getNodeNameE e0
     saw <- readIORef ref
     when (not (name `elem` saw)) $ do
       addToList ref name
-      magicE cx e $ \v t -> do
+      magicE cx e wi $ \v t -> do
         hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
         k v t
 
-magicDelayE :: Context -> E (a, Double) -> (a -> Time -> IO ()) -> IO ()
-magicDelayE cx e k = magicE cx e $ \(x,dt) t -> do
+magicDelayE :: Context
+            -> E (a, Double)
+            -> (Time -> Time)
+            -> (a -> Time -> IO ())
+            -> IO ()
+magicDelayE cx e wi k = magicE cx e wi $ \(x,dt) t -> do
   let t' = t + dt
   cxDeferIO cx [(t', k x t')]
 
-magicX :: Context -> X a -> ((Time -> a, Time -> a) -> Time -> IO ()) -> IO ()
-magicX cx arg k = case arg of
+magicX :: Context
+       -> X a
+       -> (Time -> Time)
+       -> ((Time -> a) -> Time -> IO ())
+       -> IO ()
+magicX cx arg wi k = case arg of
   PureX _ -> return ()
   TimeX -> return ()
-  FmapX f x -> magicX cx x (\(g1,g2) t -> k (f . g1, f . g2) t)
+  FmapX f x -> magicX cx x wi (\g t -> k (f . g) t)
   ApplX ff xx -> do
     let f0 = primPhase ff
     let x0 = primPhase xx
-    ffref <- newIORef (f0,f0)
-    xxref <- newIORef (x0,x0)
-    magicX cx ff $ \(g1, g2) t -> do
-      writeIORef ffref (g1, g2)
-      (h1, h2) <- readIORef xxref
-      k (g1 <*> h1, g2 <*> h2) t
-    magicX cx xx $ \(g1, g2) t -> do
-      writeIORef xxref (g1, g2)
-      (h1, h2) <- readIORef ffref
-      k (h1 <*> g1, h2 <*> g2) t
-  TrapX prim e -> do
-    phaseRef <- newIORef (const prim)
-    magicE cx e $ \x t -> do
-      g1 <- readIORef phaseRef
-      let g2 = const x
-      writeIORef phaseRef g2
-      k (g1, g2) t
-  TimeWarpX tmap tmapInv sig -> magicX cx sig $ \(g1, g2) t -> do
-    let t' = tmapInv t
-    case compare t' t of
-      LT -> hPutStrLn stderr "Warning: an acausal influence was ignored."
-      EQ -> k (g1 . tmap, g2 . tmap) t
-      GT -> case warp tmap of
-        Forward  -> cxDeferIO cx [(t', k (g1 . tmap, g2 . tmap) t')]
-        Backward -> cxDeferIO cx [(t', k (g2 . tmap, g1 . tmap) t')]
+    ffref <- newIORef f0
+    xxref <- newIORef x0
+    magicX cx ff wi $ \g t -> do
+      writeIORef ffref g
+      h <- readIORef xxref
+      k (g <*> h) t
+    magicX cx xx wi $ \g t -> do
+      writeIORef xxref g
+      h <- readIORef ffref
+      k (h <*> g) t
+  TrapX prim e -> case warp wi of
+    Forward  -> magicE cx e wi (\x t -> k (const x) t)
+    Backward -> do
+      let t' = wi 0
+      let os = reverse . takeWhile ((<= t') . fst) $ occs e
+      historyRef <- newIORef os
+      magicE cx e wi $ \x t -> do
+        modifyIORef historyRef (drop 1)
+        os' <- readIORef historyRef
+        case os' of
+          [] -> k (const prim) t
+          (_,v):_ -> k (const v) t
+  TimeWarpX tmap tmapInv x -> magicX cx x (wi . tmapInv) $ \g t -> do
+    k (g . tmap) t
 
-newMagicVar :: forall a . Context -> Bias -> X a -> IO (IORef (Time -> a))
-newMagicVar cx bias x = do
+newMagicVar :: forall a . Context
+            -> Bias
+            -> X a
+            -> (Time -> Time)
+            -> IO (IORef (Time -> a))
+newMagicVar cx bias x wi = do
   uid <- getNodeNameX x
   saw <- readIORef (cxVisitedVars cx)
   case lookup uid saw of
@@ -109,7 +127,7 @@ newMagicVar cx bias x = do
       ref <- newIORef phase
       --modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
       modifyIORef (cxVisitedVars cx) ((uid, unsafeCoerce ref :: Any):)
-      let hookup = magicX cx x (\(_,g) _ -> writeIORef ref g)
+      let hookup = magicX cx x wi (\g _ -> writeIORef ref g)
       case bias of
         NowMinus -> addToList (cxDeferredHookups cx) hookup
         Now -> hookup
@@ -138,8 +156,8 @@ simulate prog getIn doOut = do
   ref3 <- newIORef []
   let cx = Context deferIO ref1 ref2 ref3
   inputHandlersRef <- newIORef []
-  let inE = InputE (addToList inputHandlersRef)
-  magicE cx (prog inE) (flip doOut)
+  let inE = InputE (\wi hd -> do addToList inputHandlersRef (hd,wi))
+  magicE cx (prog inE) id (flip doOut)
   repeatedlyExecuteDeferredHookups cx
   hds <- readIORef inputHandlersRef
   epoch <- getCurrentTime
@@ -147,7 +165,12 @@ simulate prog getIn doOut = do
   flip finally (killThread dispThread) $ forever $ do
     v <- getIn
     t <- getSimulationTime epoch
-    mapM_ (\hd -> hd v t) hds
+    forM_ hds $ \(hd,wi) -> do
+      let t' = wi t
+      case compare t' t of
+        EQ -> hd v t
+        LT -> hPutStrLn stderr "Warning: acausal input ignored"
+        GT -> cxDeferIO cx [(t', hd v t')]
 
 
 repeatedlyExecuteDeferredHookups :: Context -> IO ()

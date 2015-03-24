@@ -25,7 +25,7 @@ maybeE f e = justE (fmap f e)
 filterE :: (a -> Bool) -> E a -> E a
 filterE p e = justE (fmap (\x -> if p x then Just x else Nothing) e)
 
--- | Forget the values associated with the events.
+-- | Forget the event values.
 voidE :: E a -> E ()
 voidE e = () <$ e
 
@@ -103,7 +103,7 @@ noise :: X Double
 noise = f <$> time where
   b = 123456789
   f t = fract (cos(23.14069263277926 * t + 2.665144142690225) * b)
-  fract x = abs (snd (properFraction x))
+  fract x = abs (snd (properFraction x :: (Integer,Double)))
 
 -- | Pairs occurrence @n-1@ with occurrence @n@. Nothing happens on the first
 -- occurrence.
