@@ -18,6 +18,8 @@ import Data.Maybe
 import GHC.Prim (Any)
 import Unsafe.Coerce
 
+import Debug.Trace
+
 import Control.Broccoli.Eval
 import Control.Broccoli.Dispatch
 import Control.Broccoli.Combinators
@@ -37,24 +39,24 @@ data Context = Context
 magicE :: Context
        -> E a
        -> (Time -> Time)
+       -> (Time -> Time)
        -> (a -> Time -> IO ())
        -> IO ()
-magicE cx e0 wi k = case e0 of
-  ConstantE os -> case compare (wi 0) (wi 1) of
-    EQ -> error "bad time warp"
-    LT -> cxDeferIO cx (map (\(t,x) -> ((wi t), k x (wi t))) os)
-    GT -> cxDeferIO cx (map (\(t,x) -> ((wi t), k x (wi t))) (reverse os))
-  FmapE f e -> magicE cx e wi (\x t -> k (f x) t)
-  JustE e -> magicE cx e wi $ \x t -> case x of
+magicE cx e0 w wi k = case e0 of
+  ConstantE os -> case warp w of
+    Forward  -> cxDeferIO cx (map (\(t,x) -> ((wi t), k x (wi t))) os)
+    Backward -> cxDeferIO cx (map (\(t,x) -> ((wi t), k x (wi t))) (reverse os))
+  FmapE f e -> magicE cx e w wi (\x t -> k (f x) t)
+  JustE e -> magicE cx e w wi $ \x t -> case x of
     Nothing -> return ()
     Just y -> k y t
   UnionE e1 e2 -> do
-    magicE cx e1 wi k
-    magicE cx e2 wi k
-  DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e wi k)
+    magicE cx e1 w wi k
+    magicE cx e2 w wi k
+  DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e w wi k)
   SnapshotE bias cons x e -> do
-    ref <- newMagicVar cx bias x wi
-    magicE cx e wi $ \v t -> do
+    ref <- newMagicVar cx bias x w wi
+    magicE cx e w wi $ \v t -> do
       g <- readIORef ref
       k (cons (g t) v) t
   InputE hookup -> hookup wi k
@@ -64,57 +66,59 @@ magicE cx e0 wi k = case e0 of
     saw <- readIORef ref
     when (not (name `elem` saw)) $ do
       addToList ref name
-      magicE cx e wi $ \v t -> do
+      magicE cx e w wi $ \v t -> do
         hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
         k v t
 
 magicDelayE :: Context
             -> E (a, Double)
             -> (Time -> Time)
+            -> (Time -> Time)
             -> (a -> Time -> IO ())
             -> IO ()
-magicDelayE cx e wi k = magicE cx e wi $ \(x,dt) t -> do
+magicDelayE cx e w wi k = magicE cx e w wi $ \(x,dt) t -> do
   let t' = t + dt
   cxDeferIO cx [(t', k x t')]
 
 magicX :: Context
        -> X a
        -> (Time -> Time)
+       -> (Time -> Time)
        -> ((Time -> a) -> Time -> IO ())
        -> IO ()
-magicX cx arg wi k = case arg of
+magicX cx arg w wi k = case arg of
   PureX _ -> return ()
   TimeX -> return ()
-  FmapX f x -> magicX cx x wi (\g t -> k (f . g) t)
+  FmapX f x -> magicX cx x w wi (\g t -> k (f . g) t)
   ApplX ff xx -> do
     let f0 = primPhase ff
     let x0 = primPhase xx
     ffref <- newIORef f0
     xxref <- newIORef x0
-    magicX cx ff wi $ \g t -> do
+    magicX cx ff w wi $ \g t -> do
       writeIORef ffref g
       h <- readIORef xxref
       k (g <*> h) t
-    magicX cx xx wi $ \g t -> do
+    magicX cx xx w wi $ \g t -> do
       writeIORef xxref g
       h <- readIORef ffref
       k (h <*> g) t
-  TrapX prim e -> case warp wi of
-    Forward  -> magicE cx e wi (\x t -> k (const x) t)
+  TrapX prim e -> case warp w of
+    Forward  -> magicE cx e w wi (\x t -> k (const x) t)
     Backward -> do
       let t' = wi 0
       let os = reverse . takeWhile ((<= t') . fst) $ occs e
       historyRef <- newIORef os
       valueRef <- newIORef (fromMaybe prim (snd <$> listToMaybe os))
-      magicE cx e wi $ \x t -> do
+      magicE cx e w wi $ \x t -> do
         vPrev <- readIORef valueRef
         modifyIORef historyRef (drop 1)
         os' <- readIORef historyRef
         writeIORef valueRef (fromMaybe prim (snd <$> listToMaybe os'))
         case os' of
-          [] -> k (patch (const prim) vPrev (wi t)) t
-          (_,v):_ -> k (patch (const v) vPrev (wi t)) t
-  TimeWarpX tmap tmapInv x -> magicX cx x (wi . tmapInv) $ \g t -> do
+          [] -> k (patch (const prim) vPrev (w t)) t
+          (_,v):_ -> k (patch (const v) vPrev (w t)) t
+  TimeWarpX tmap tmapInv x -> magicX cx x (tmap . w) (wi . tmapInv) $ \g t -> do
     k (g . tmap) t
 
 patch :: (Time -> a) -> a -> Time -> (Time -> a)
@@ -125,8 +129,9 @@ newMagicVar :: forall a . Context
             -> Bias
             -> X a
             -> (Time -> Time)
+            -> (Time -> Time)
             -> IO (IORef (Time -> a))
-newMagicVar cx bias x wi = do
+newMagicVar cx bias x w wi = do
   uid <- getNodeNameX x
   saw <- readIORef (cxVisitedVars cx)
   case lookup uid saw of
@@ -135,7 +140,7 @@ newMagicVar cx bias x wi = do
       ref <- newIORef phase
       --modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
       modifyIORef (cxVisitedVars cx) ((uid, unsafeCoerce ref :: Any):)
-      let hookup = magicX cx x wi (\g _ -> writeIORef ref g)
+      let hookup = magicX cx x w wi (\g _ -> writeIORef ref g)
       case bias of
         NowMinus -> addToList (cxDeferredHookups cx) hookup
         Now -> hookup
@@ -165,7 +170,7 @@ simulate prog getIn doOut = do
   let cx = Context deferIO ref1 ref2 ref3
   inputHandlersRef <- newIORef []
   let inE = InputE (\wi hd -> do addToList inputHandlersRef (hd,wi))
-  magicE cx (prog inE) id (flip doOut)
+  magicE cx (prog inE) id id (flip doOut)
   repeatedlyExecuteDeferredHookups cx
   hds <- readIORef inputHandlersRef
   epoch <- getCurrentTime
