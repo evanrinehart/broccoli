@@ -58,15 +58,25 @@ magicE cx e0 w wi k = case e0 of
       g <- readIORef ref
       k (cons (g t) v) t
   InputE hookup -> hookup wi k
+  EdgeE x -> do
+    let g0 = primPhase x
+    ref <- newIORef g0
+    magicX cx x w wi $ \g' t -> do
+      g <- readIORef ref
+      writeIORef ref g'
+      k (g t, g' t) t
   DebugE toString e -> do
     let ref = cxDebuggers cx
     name <- getNodeNameE e0
     saw <- readIORef ref
-    when (not (name `elem` saw)) $ do
-      addToList ref name
-      magicE cx e w wi $ \v t -> do
-        hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
-        k v t
+    if not (name `elem` saw)
+      then do
+        addToList ref name
+        magicE cx e w wi $ \v t -> do
+          hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
+          k v t
+      else do
+        magicE cx e w wi (\v t -> k v t)
 
 magicDelayE :: Context
             -> E (a, Double)
@@ -168,7 +178,9 @@ simulate prog getIn doOut = do
   let cx = Context deferIO ref1 ref2 ref3
   inputHandlersRef <- newIORef []
   let inE = InputE (\wi hd -> do addToList inputHandlersRef (hd,wi))
-  magicE cx (prog inE) id id (flip doOut)
+  let e = prog inE
+  loopCheckE e [] [] ["output"]
+  magicE cx e id id (flip doOut)
   repeatedlyExecuteDeferredHookups cx
   hds <- readIORef inputHandlersRef
   epoch <- getCurrentTime
@@ -229,3 +241,81 @@ instance Show NodeName where
 
 fromStableName :: StableName a -> NodeName
 fromStableName sn = NodeName (unsafeCoerce sn)
+
+crap :: [String] -> IO ()
+crap path = fail msg where
+  msg = "loop detected " ++ show (reverse path)
+
+loopCheckE :: E a -> [NodeName] -> [NodeName] -> [String] -> IO ()
+loopCheckE arg jumps curs path = case arg of
+  ConstantE _ -> return ()
+  FmapE _ e -> do
+    i <- getNodeNameE arg
+    let path' = ("fmapE("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckE e jumps (i:curs) path'
+  JustE e -> do
+    i <- getNodeNameE arg
+    let path' = ("justE("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckE e jumps (i:curs) path'
+  UnionE e1 e2 -> do
+    i <- getNodeNameE arg
+    let path' = ("unionE("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckE e1 jumps (i:curs) path'
+    loopCheckE e2 jumps (i:curs) path'
+  DelayE e -> do
+    i <- getNodeNameE arg
+    let path' = ("delayE("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    j <- getNodeNameE e
+    if j `elem` jumps
+      then return ()
+      else loopCheckE e (j:jumps) [] path'
+  SnapshotE _ _ x e -> do
+    i <- getNodeNameE arg
+    let path' = ("snapshot("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckE e jumps (i:curs) path'
+    j <- getNodeNameX x
+    if j `elem` jumps
+      then return ()
+      else loopCheckX x (j:jumps) [] path'
+  InputE _ -> return ()
+  EdgeE x -> do
+    i <- getNodeNameE arg
+    let path' = ("edge("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckX x jumps (i:curs) path'
+  DebugE _ e -> do
+    i <- getNodeNameE arg
+    let path' = ("debugE("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckE e jumps (i:curs) path'
+  
+loopCheckX :: X a -> [NodeName] -> [NodeName] -> [String] -> IO ()
+loopCheckX arg jumps curs path = case arg of
+  PureX _ -> return ()
+  TimeX -> return ()
+  FmapX _ x -> do
+    i <- getNodeNameX arg
+    let path' = ("fmapX("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckX x jumps (i:curs) path'
+  ApplX ff xx -> do
+    i <- getNodeNameX arg
+    let path' = ("<*>("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckX ff jumps (i:curs) path'
+    loopCheckX xx jumps (i:curs) path'
+  TrapX _ e -> do
+    i <- getNodeNameX arg
+    let path' = ("trap("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckE e jumps (i:curs) path'
+  TimeWarpX _ _ x -> do
+    i <- getNodeNameX arg
+    let path' = ("timeWarp("++show i++")") : path
+    when (i `elem` curs) (crap path')
+    loopCheckX x jumps (i:curs) path'

@@ -95,7 +95,7 @@ dispatcher epochMv tv wake = do
         cancel
 
 million :: Double
-million = toEnum (10^(6::Int))
+million = 1e6
 
 cancellableThread :: IO () -> IO (IO ())
 cancellableThread io = do

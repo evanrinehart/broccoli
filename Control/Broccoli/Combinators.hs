@@ -47,9 +47,6 @@ dilate :: Double -> X a -> X a
 dilate 0 _ = error "dilate zero"
 dilate rate x = timeWarp (/rate) (*rate) x
 
--- | Occurs when something interesting happens between two successive events.
-edge :: (a -> a -> Maybe b) -> E a -> E b
-edge diff e = maybeE (uncurry diff) (pairE e)
 
 -- | Sum over events using an initial state and a state transition function.
 mealy :: s -> (a -> s -> s) -> E a -> X s
@@ -126,3 +123,5 @@ debugX sr toString x = liftA2 const x dummy where
 -- | Format time like the debuggers and testbenches.
 showTime :: Time -> String
 showTime t = showFFloat (Just 5) t ""
+
+

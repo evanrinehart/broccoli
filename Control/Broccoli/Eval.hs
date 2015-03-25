@@ -23,6 +23,7 @@ data E a where
   UnionE :: E a -> E a -> E a
   DelayE :: E (a, Double) -> E a
   SnapshotE :: forall a b c . Bias -> (c -> b -> a) -> X c -> E b -> E a
+  EdgeE :: forall a b . a ~ (b,b) => X b -> E a
   InputE :: ((Time -> Time) -> (a -> Time -> IO ()) -> IO ()) -> E a
   DebugE :: (a -> String) -> E a -> E a
 
@@ -108,6 +109,13 @@ timeWarp' f x = if timeOnlyX x
   then TimeWarpX f undefined x
   else error "timeWarp': can't handle events. Try regular timeWarp."
 
+-- | Event occurs on transitions in a piecewise constant signal. Doesn't
+-- work on continuously varying signals.
+edge :: X a -> E (a, a)
+edge x = if containsTimeX x
+  then error "edge: input not piecewise constant"
+  else EdgeE x
+
 timeOnlyX :: X a -> Bool
 timeOnlyX arg = case arg of
   PureX _ -> True
@@ -116,6 +124,15 @@ timeOnlyX arg = case arg of
   ApplX ff xx -> timeOnlyX ff && timeOnlyX xx
   TrapX _ _ -> False
   TimeWarpX _ _ x -> timeOnlyX x
+
+containsTimeX :: X a -> Bool
+containsTimeX arg = case arg of
+  PureX _ -> False
+  TimeX -> True
+  FmapX _ x -> containsTimeX x
+  ApplX ff xx -> containsTimeX ff || containsTimeX xx
+  TrapX _ _ -> False
+  TimeWarpX _ _ x -> containsTimeX x
 
 -- | Measure the value of a signal at some time.
 at :: X a -> Time -> a
@@ -142,12 +159,28 @@ findOcc arg t test = case arg of
       Nothing -> Just (t1, x1)
       Just (t2, x2) -> Just (occUnion test (t1,x1) (t2,x2))
   DelayE e -> occHay test (map delay (occs e)) t
-  SnapshotE bias cons sig e -> case findOcc e t test of
+  SnapshotE bias cons x e -> case findOcc e t test of
     Nothing -> Nothing
-    Just (tOcc, x) -> let g = findPhase sig tOcc (occPhase test bias)
-                      in Just (tOcc, cons (g tOcc) x)
+    Just (tOcc, v) -> let g = findPhase x tOcc (occPhase test bias)
+                      in Just (tOcc, cons (g tOcc) v)
+  EdgeE x -> findTrans x t test
   InputE _ -> Nothing
   DebugE _ e -> findOcc e t test
+
+findTrans :: X a -> Time -> OccTest -> Maybe (Time, (a, a))
+findTrans arg t test = case arg of
+  PureX v -> Nothing
+  TimeX -> error "findTrans TimeX"
+  FmapX f x -> fmap (\(t',(v0,v1)) -> (t',(f v0, f v1))) (findTrans x t test)
+  ApplX ff xx -> error "hmm"
+  TrapX prim e -> case findOcc e t test of
+    Nothing -> Nothing
+    Just (t',v1) -> case findOcc e t' (occLose test) of
+      Nothing -> Just (t', (prim, v1))
+      Just (_,v0) -> Just (t', (v0, v1))
+  TimeWarpX g _ x -> case warp g of
+    Forward  -> findTrans x (g t) test
+    Backward -> error "i dont know"
 
 findPhase :: X a -> Time -> PhaseTest -> (Time -> a)
 findPhase arg t test = case arg of
@@ -183,6 +216,7 @@ occs arg = case arg of
         let g = findPhase x t phaseMinus in
         let xv = g t in
         (t, cons xv ev)
+  EdgeE x -> error "cool"
   InputE _ -> []
   DebugE _ e -> occs e
 
