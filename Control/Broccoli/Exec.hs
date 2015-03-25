@@ -14,12 +14,15 @@ import Control.Exception
 import Numeric
 import System.IO
 import Data.Maybe
+import Data.List
+import Data.Ord
+import Data.Function
+import Control.Concurrent.STM
 
 import GHC.Prim (Any)
 import Unsafe.Coerce
 
 import Control.Broccoli.Eval
-import Control.Broccoli.Dispatch
 import Control.Broccoli.Combinators
 
 -- Take a program and execute it in real time with real inputs.
@@ -31,6 +34,8 @@ data Context = Context
   , cxDeferredHookups :: IORef [IO ()]
   , cxDebuggers :: IORef [NodeName]
   , cxVisitedVars :: IORef [(NodeName, Any)]  -- Any = IORef (Time -> a)
+  , cxDebouncers :: IORef [(Integer, IO ())]
+  , cxGenerator :: IORef Integer
   }
 
 -- execute effects to setup runtime handler
@@ -38,33 +43,37 @@ magicE :: Context
        -> E a
        -> (Time -> Time)
        -> (Time -> Time)
-       -> (a -> Time -> IO ())
+       -> ([a] -> Time -> IO ())
        -> IO ()
 magicE cx e0 w wi k = case e0 of
-  ConstantE os -> case warp w of
-    Forward  -> cxDeferIO cx (map (\(t,x) -> ((wi t), k x (wi t))) os)
-    Backward -> cxDeferIO cx (map (\(t,x) -> ((wi t), k x (wi t))) (reverse os))
-  FmapE f e -> magicE cx e w wi (\x t -> k (f x) t)
-  JustE e -> magicE cx e w wi $ \x t -> case x of
-    Nothing -> return ()
-    Just y -> k y t
+  ConstantE os -> cxDeferIO cx . map f . groupBy (on (==) fst) $ os' where
+    f chunk = ((wi t), k vs (wi t)) where
+      t = fst (head chunk)
+      vs = map snd chunk
+    os' = case warp w of
+      Forward  -> os
+      Backward -> reverse os
+  FmapE f e -> magicE cx e w wi (\vs t -> k (map f vs) t)
+  JustE e -> magicE cx e w wi $ \mvs t -> case catMaybes mvs of
+    [] -> return ()
+    vs -> k vs t
   UnionE e1 e2 -> do
     magicE cx e1 w wi k
     magicE cx e2 w wi k
   DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e w wi k)
   SnapshotE bias cons x e -> do
     ref <- newMagicVar cx bias x w wi
-    magicE cx e w wi $ \v t -> do
+    magicE cx e w wi $ \vs t -> do
       g <- readIORef ref
-      k (cons (g t) v) t
-  InputE hookup -> hookup wi k
+      k (map (cons (g t)) vs) t
+  InputE hookup -> hookup wi (\v t -> k [v] t)
   EdgeE x -> do
     let g0 = primPhase x
     ref <- newIORef g0
     magicX cx x w wi $ \g' t -> do
       g <- readIORef ref
       writeIORef ref g'
-      k (g t, g' t) t
+      k [(g t, g' t)] t
   DebugE toString e -> do
     let ref = cxDebuggers cx
     name <- getNodeNameE e0
@@ -72,21 +81,29 @@ magicE cx e0 w wi k = case e0 of
     if not (name `elem` saw)
       then do
         addToList ref name
-        magicE cx e w wi $ \v t -> do
-          hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
-          k v t
+        magicE cx e w wi $ \vs t -> do
+          forM_ vs $ \v -> do
+            hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
+          k vs t
       else do
-        magicE cx e w wi (\v t -> k v t)
+        magicE cx e w wi (\vs t -> k vs t)
 
 magicDelayE :: Context
             -> E (a, Double)
             -> (Time -> Time)
             -> (Time -> Time)
-            -> (a -> Time -> IO ())
+            -> ([a] -> Time -> IO ())
             -> IO ()
-magicDelayE cx e w wi k = magicE cx e w wi $ \(x,dt) t -> do
-  let t' = t + dt
-  cxDeferIO cx [(t', k x t')]
+magicDelayE cx e w wi k = magicE cx e w wi $ \delayVs t -> do
+  -- groups :: [[(Time, a)]]
+  let groups = groupBy (on (==) fst)
+             . sortBy (comparing fst)
+             . map (\(v, dt) -> (t + dt, v))
+             $ delayVs
+  forM_ groups $ \chunk -> do -- vs :: [(Time, a)]
+    let t' = fst (head chunk)
+    let vs = map snd chunk
+    cxDeferIO cx [(t', k vs t')]
 
 magicX :: Context
        -> X a
@@ -111,8 +128,10 @@ magicX cx arg w wi k = case arg of
       writeIORef xxref g
       h <- readIORef ffref
       k (h <*> g) t
-  TrapX prim e -> case warp w of
-    Forward  -> magicE cx e w wi (\x t -> k (const x) t)
+  TrapX _ e -> case warp w of
+    Forward  -> magicE cx e w wi (\vs t -> k (const (last vs)) t)
+    Backward -> error "simulation doesn't support time reversal"
+{-
     Backward -> do
       let t' = wi 0
       let os = reverse . takeWhile ((<= t') . fst) $ occs e
@@ -126,6 +145,7 @@ magicX cx arg w wi k = case arg of
         case os' of
           [] -> k (patch (const prim) vPrev (w t)) t
           (_,v):_ -> k (patch (const v) vPrev (w t)) t
+-}
   TimeWarpX tmap tmapInv x -> magicX cx x (tmap . w) (wi . tmapInv) $ \g t -> do
     k (g . tmap) t
 
@@ -162,25 +182,28 @@ listIsEmpty :: IORef [a] -> IO Bool
 listIsEmpty ref = null <$> readIORef ref
 
 whileM :: IO Bool -> IO a -> IO ()
-whileM check action = do
-  b <- check
-  if b then action >> whileM check action else return ()
+whileM test action = do
+  b <- test
+  if b then action >> whileM test action else return ()
 
 -- | Run a program in real time with a source of external input and an
 -- output handler. The computation never terminates.
 simulate :: (E a -> E b) -> IO a -> (Time -> b -> IO ()) -> IO ()
 simulate prog getIn doOut = do
+  thisThreadId <- myThreadId
   epochMv <- newEmptyMVar
-  (deferIO, dispThread) <- newScheduler epochMv
+  (deferIO, dispThread) <- newScheduler epochMv thisThreadId
   ref1 <- newIORef []
   ref2 <- newIORef []
   ref3 <- newIORef []
-  let cx = Context deferIO ref1 ref2 ref3
+  ref4 <- newIORef []
+  genRef <- newIORef 0
+  let cx = Context deferIO ref1 ref2 ref3 ref4 genRef
   inputHandlersRef <- newIORef []
   let inE = InputE (\wi hd -> do addToList inputHandlersRef (hd,wi))
   let e = prog inE
   loopCheckE e [] [] ["output"]
-  magicE cx e id id (flip doOut)
+  magicE cx e id id (\vs t -> mapM_ (doOut t) vs)
   repeatedlyExecuteDeferredHookups cx
   hds <- readIORef inputHandlersRef
   epoch <- getCurrentTime
@@ -224,6 +247,8 @@ hang = do
 
 
 
+-- The simulator relies on GHC stable names for observable sharing.
+
 getNodeNameX :: X a -> IO NodeName
 getNodeNameX x = do
   sn <- x `seq` makeStableName x
@@ -241,6 +266,12 @@ instance Show NodeName where
 
 fromStableName :: StableName a -> NodeName
 fromStableName sn = NodeName (unsafeCoerce sn)
+
+
+
+-- A loop check to run before execution. This doesn't detect all loops, only
+-- ones that would cause a freeze-up during initialization. Some loops are
+-- ok.
 
 crap :: [String] -> IO ()
 crap path = fail msg where
@@ -319,3 +350,111 @@ loopCheckX arg jumps curs path = case arg of
     let path' = ("timeWarp("++show i++")") : path
     when (i `elem` curs) (crap path')
     loopCheckX x jumps (i:curs) path'
+
+
+
+-- The edge detector reacts to updates of a piecewise constant signal by
+-- emitting an event containing the value at t- and the value at t+. More
+-- precisely, if events occuring at the same time would cause the signal to
+-- update more than once in the same t, only the initial value and the final
+-- value will be reported in the event. And there will only be one event.
+
+newDebounceId :: IORef Integer -> IO Integer
+newDebounceId ref = do
+  n <- readIORef ref
+  modifyIORef ref succ
+  return n
+
+registerDebounce :: IO () -> Integer -> IORef [(Integer, IO ())] -> IO ()
+registerDebounce action did ref = modifyIORef ref rdRec where
+  rdRec [] = [(did, action)]
+  rdRec ((did',io):dbs) | did' == did = (did,action) : dbs
+                        | otherwise = (did',io) : rdRec dbs
+
+executeDebounces :: IORef [(Integer, IO ())] -> IO ()
+executeDebounces ref = do
+  ios <- map snd <$> readIORef ref
+  sequence_ ios
+
+
+
+
+-- The dispatcher is a thread which sleeps until one of the conditions:
+-- 1. a scheduled IO action must be executed
+-- 2. an external agent wants something executed
+
+newScheduler :: MVar UTCTime
+             -> ThreadId
+             -> IO ([(Time, IO ())] -> IO (), ThreadId)
+newScheduler epochMv parentThread = do
+  --tv <- newTVarIO M.empty
+  tv <- newTVarIO []
+  wake <- newTChanIO
+  tid <- forkFinally (dispatcher epochMv tv wake) $ \ r -> case r of
+    Left e -> throwTo parentThread e
+    Right _ -> return ()
+  return (schedule tv wake, tid)
+
+schedule :: TVar [(Time, IO ())] -> TChan () -> [(Time, IO ())] -> IO ()
+schedule tv wake timeActions = do
+  atomically $ do
+    q <- readTVar tv
+    --let q' = M.alter (insertAction action) target q
+    let q' = merge (comparing fst) q timeActions
+    writeTVar tv q'
+    writeTChan wake ()
+
+
+dispatcher :: MVar UTCTime
+           -> TVar [(Time, IO ())]
+           -> TChan ()
+           -> IO ()
+dispatcher epochMv tv wake = do
+  epoch <- takeMVar epochMv
+  forever $ do
+    now <- getSimulationTime epoch
+    (nextWake, ios) <- atomically $ do
+      q <- readTVar tv
+      let (lte, gt) = span ((<= now) . fst) q
+      --let (lt, eq, gt) = M.splitLookup now q
+      --let currents = fromMaybe [] eq
+      writeTVar tv gt
+      --return
+        --( fmap (fst . fst) (M.minViewWithKey gt)
+        --, concatMap snd (M.assocs lt) ++ currents )
+      return (fmap fst (listToMaybe gt), map snd lte)
+    sequence_ ios
+    case nextWake of
+      Nothing -> atomically (readTChan wake)
+      Just tNext -> do
+        let ms = ceiling (min (tNext - now) 10 * million)
+        cancel <- cancellableThread $ do
+          threadDelay ms
+          atomically (writeTChan wake ())
+        atomically (readTChan wake)
+        cancel
+
+million :: Double
+million = 1e6
+
+cancellableThread :: IO () -> IO (IO ())
+cancellableThread io = do
+  mv <- newEmptyMVar
+  tid <- forkIO $ do
+    io
+    _ <- tryTakeMVar mv
+    return ()
+  putMVar mv tid
+  return $ do
+    mtarget <- tryTakeMVar mv
+    case mtarget of
+      Nothing -> return ()
+      Just target -> killThread target
+
+
+getSimulationTime :: UTCTime -> IO Double
+getSimulationTime epoch = do
+  now <- getCurrentTime
+  let t = diffUTCTime now epoch
+  return (realToFrac t)
+

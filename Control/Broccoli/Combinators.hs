@@ -8,14 +8,6 @@ import Numeric
 import Control.Broccoli.Eval
 
 
--- | A signal that remembers the most recent occurrence of an event.
--- Takes a value to output prior to any events.
-trap :: a -> E a -> X a
-trap = TrapX
-
-justE :: E (Maybe a) -> E a
-justE = JustE
-
 maybeE :: (a -> Maybe b) -> E a -> E b
 maybeE f e = justE (fmap f e)
 

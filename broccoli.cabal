@@ -19,7 +19,6 @@ library
   exposed-modules:     Control.Broccoli,
                        Control.Broccoli.Eval,
                        Control.Broccoli.Exec,
-                       Control.Broccoli.Dispatch,
                        Control.Broccoli.Combinators
   -- other-modules:       
   other-extensions:    GADTs, RankNTypes
