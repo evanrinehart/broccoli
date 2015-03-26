@@ -8,6 +8,18 @@ import Numeric
 import Control.Broccoli.Eval
 
 
+counter :: E () -> X Int
+counter bump = out where
+  out = trap 0 e2
+  e2 = snapshot_ next bump
+  next = (+1) <$> out
+
+counter' :: E () -> X Int
+counter' bump = out where
+  out = trap 0 e2
+  e2 = snapshot_ next bump
+  next = (+1) <$> (counter' bump)
+
 maybeE :: (a -> Maybe b) -> E a -> E b
 maybeE f e = justE (fmap f e)
 

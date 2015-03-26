@@ -66,7 +66,7 @@ magicE cx e0 w wi es k = case e0 of
     [] -> return ()
     vs -> k vs t
   UnionE e1 e2 -> do
-    magicE cx e1 w wi [] k
+    magicE cx e1 w wi es k
     magicE cx e2 w wi es k
   DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e w wi es k)
   SnapshotE bias cons x e -> do
@@ -109,7 +109,7 @@ magicDelayE :: Context
             -> IO ()
 magicDelayE cx e w wi es k = do
   srcOrd <- takeSrcOrd cx
-  magicE cx e w wi es $ \delayVs t -> do
+  magicE cx e w wi [] $ \delayVs t -> do
     -- groups :: [[(Time, a)]]
     let groups = groupBy (on (==) fst)
                . sortBy (comparing fst)
@@ -136,7 +136,7 @@ magicX cx arg w wi es k = case arg of
     let x0 = primPhase xx
     ffref <- newIORef f0
     xxref <- newIORef x0
-    magicX cx ff w wi [] $ \g t -> do
+    magicX cx ff w wi es $ \g t -> do
       writeIORef ffref g
       h <- readIORef xxref
       k (g <*> h) t
@@ -433,7 +433,7 @@ dispatcher epochMv tv wake flushRef = do
   epoch <- takeMVar epochMv
   forever $ do
     now <- getSimulationTime epoch
-    (nextWake, variousIO) <- atomically $ do
+    (nextWake, variousTrigs) <- atomically $ do
       q <- readTVar tv
       let (lte, gt) = span ((<= now) . trigTime) q
       --let (lt, eq, gt) = M.splitLookup now q
@@ -443,11 +443,9 @@ dispatcher epochMv tv wake flushRef = do
         --( fmap (fst . fst) (M.minViewWithKey gt)
         --, concatMap snd (M.assocs lt) ++ currents )
       return (fmap trigTime (listToMaybe gt), lte)
-    forM_ (groupBy (on (==) trigTime) variousIO) $ \sameTimeIOs -> do
-      mapM trigIO sameTimeIOs
-      testIs <- map fst <$> readIORef flushRef
-      forM_ testIs (\i -> cxFlush i flushRef)
-      -- fix this shit
+    forM_ (groupBy (on (==) trigTime) variousTrigs) $ \sameTimeTrigs -> do
+      let sorted = flushAlgorithm flushRef sameTimeTrigs
+      sequence_ sorted
     case nextWake of
       Nothing -> atomically (readTChan wake)
       Just tNext -> do
@@ -500,3 +498,16 @@ takeSrcOrd cx = do
   n <- readIORef ref
   writeIORef ref (n+1)
   return n
+
+
+-- For dispatch ordering to match the evaluation ordering, we need to do
+-- satisfy at least two requirements:
+-- 1. Delay the action of edge components until the last event at a given
+-- time point that would affect them happens.
+-- 2. Execute the action of edge components as soon as possible given rule 1.
+-- That is, don't wait for other events before doing this.
+
+flushAlgorithm :: IORef [(Int, IO ())] -> [Trigger] -> [IO ()]
+flushAlgorithm ref trigs = ans where
+  flush = cxFlush 0 ref
+  ans = map trigIO trigs ++ [flush]
