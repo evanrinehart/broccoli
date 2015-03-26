@@ -51,14 +51,6 @@ mealy s0 trans e = out where
 accum :: s -> E (s -> s) -> X s
 accum s0 = mealy s0 ($)
 
--- | Delay occurrences of an event.
-delayE :: Double -> E a -> E a
-delayE dt e = DelayE (fmap (,dt) e)
-
--- | Like 'delayE' but the amount of delay is determined on a per-event basis.
-delayE' :: E (a, Double) -> E a
-delayE' = DelayE
-
 -- | An event that occurs once at the beginning of the simulation.
 boot :: E ()
 boot = occurs [(0, ())]

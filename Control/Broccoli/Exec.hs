@@ -28,52 +28,64 @@ import Control.Broccoli.Combinators
 -- Take a program and execute it in real time with real inputs.
 
 -- The justification for why this ought to work goes here.
+-- Once justification is determined.
 
 data Context = Context
-  { cxDeferIO :: [(Time, IO ())] -> IO ()
+  { cxDeferIO :: [Trigger] -> IO ()
   , cxDeferredHookups :: IORef [IO ()]
   , cxDebuggers :: IORef [NodeName]
   , cxVisitedVars :: IORef [(NodeName, Any)]  -- Any = IORef (Time -> a)
-  , cxDebouncers :: IORef [(Integer, IO ())]
-  , cxGenerator :: IORef Integer
+  , cxFlushRef :: IORef [(Int, IO ())]
+  , cxGenerator :: IORef Int
   }
 
--- execute effects to setup runtime handler
+type EdgeSet = [Int]
+
+-- execute effects to setup runtime handlers
 magicE :: Context
        -> E a
        -> (Time -> Time)
        -> (Time -> Time)
+       -> EdgeSet
        -> ([a] -> Time -> IO ())
        -> IO ()
-magicE cx e0 w wi k = case e0 of
-  ConstantE os -> cxDeferIO cx . map f . groupBy (on (==) fst) $ os' where
-    f chunk = ((wi t), k vs (wi t)) where
-      t = fst (head chunk)
-      vs = map snd chunk
-    os' = case warp w of
-      Forward  -> os
-      Backward -> reverse os
-  FmapE f e -> magicE cx e w wi (\vs t -> k (map f vs) t)
-  JustE e -> magicE cx e w wi $ \mvs t -> case catMaybes mvs of
+magicE cx e0 w wi es k = case e0 of
+  ConstantE os -> do
+    srcOrd <- takeSrcOrd cx
+    let os' = case warp w of
+                Forward  -> os
+                Backward -> error "no time reversal"
+    let f chunk = Trigger t' srcOrd es io where
+                    t' = wi t
+                    io = k vs t'
+                    t = fst (head chunk)
+                    vs = map snd chunk
+    cxDeferIO cx . map f . groupBy (on (==) fst) $ os'
+  FmapE f e -> magicE cx e w wi es (\vs t -> k (map f vs) t)
+  JustE e -> magicE cx e w wi es $ \mvs t -> case catMaybes mvs of
     [] -> return ()
     vs -> k vs t
   UnionE e1 e2 -> do
-    magicE cx e1 w wi k
-    magicE cx e2 w wi k
-  DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e w wi k)
+    magicE cx e1 w wi [] k
+    magicE cx e2 w wi es k
+  DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e w wi es k)
   SnapshotE bias cons x e -> do
     ref <- newMagicVar cx bias x w wi
-    magicE cx e w wi $ \vs t -> do
+    magicE cx e w wi es $ \vs t -> do
       g <- readIORef ref
       k (map (cons (g t)) vs) t
-  InputE hookup -> hookup wi (\v t -> k [v] t)
+  InputE hookup -> do
+    srcOrd <- takeSrcOrd cx
+    hookup srcOrd es wi k
   EdgeE x -> do
     let g0 = primPhase x
     ref <- newIORef g0
-    magicX cx x w wi $ \g' t -> do
-      g <- readIORef ref
-      writeIORef ref g'
-      k [(g t, g' t)] t
+    edgeId <- newEdgeId (cxGenerator cx)
+    magicX cx x w wi (edgeId:es) $ \g' t -> do
+      deferFlush (cxFlushRef cx) edgeId $ do
+        g <- readIORef ref
+        writeIORef ref g'
+        k [(g t, g' t)] t
   DebugE toString e -> do
     let ref = cxDebuggers cx
     name <- getNodeNameE e0
@@ -81,55 +93,59 @@ magicE cx e0 w wi k = case e0 of
     if not (name `elem` saw)
       then do
         addToList ref name
-        magicE cx e w wi $ \vs t -> do
+        magicE cx e w wi es $ \vs t -> do
           forM_ vs $ \v -> do
             hPutStrLn stderr (unwords [showFFloat (Just 5) t "", toString v])
           k vs t
       else do
-        magicE cx e w wi (\vs t -> k vs t)
+        magicE cx e w wi es (\vs t -> k vs t)
 
 magicDelayE :: Context
             -> E (a, Double)
             -> (Time -> Time)
             -> (Time -> Time)
+            -> EdgeSet
             -> ([a] -> Time -> IO ())
             -> IO ()
-magicDelayE cx e w wi k = magicE cx e w wi $ \delayVs t -> do
-  -- groups :: [[(Time, a)]]
-  let groups = groupBy (on (==) fst)
-             . sortBy (comparing fst)
-             . map (\(v, dt) -> (t + dt, v))
-             $ delayVs
-  forM_ groups $ \chunk -> do -- vs :: [(Time, a)]
-    let t' = fst (head chunk)
-    let vs = map snd chunk
-    cxDeferIO cx [(t', k vs t')]
+magicDelayE cx e w wi es k = do
+  srcOrd <- takeSrcOrd cx
+  magicE cx e w wi es $ \delayVs t -> do
+    -- groups :: [[(Time, a)]]
+    let groups = groupBy (on (==) fst)
+               . sortBy (comparing fst)
+               . map (\(v, dt) -> (t + dt, v))
+               $ delayVs
+    forM_ groups $ \chunk -> do -- vs :: [(Time, a)]
+      let t' = fst (head chunk)
+      let vs = map snd chunk
+      cxDeferIO cx [Trigger t' srcOrd es (k vs t')]
 
 magicX :: Context
        -> X a
        -> (Time -> Time)
        -> (Time -> Time)
+       -> EdgeSet
        -> ((Time -> a) -> Time -> IO ())
        -> IO ()
-magicX cx arg w wi k = case arg of
+magicX cx arg w wi es k = case arg of
   PureX _ -> return ()
   TimeX -> return ()
-  FmapX f x -> magicX cx x w wi (\g t -> k (f . g) t)
+  FmapX f x -> magicX cx x w wi es (\g t -> k (f . g) t)
   ApplX ff xx -> do
     let f0 = primPhase ff
     let x0 = primPhase xx
     ffref <- newIORef f0
     xxref <- newIORef x0
-    magicX cx ff w wi $ \g t -> do
+    magicX cx ff w wi [] $ \g t -> do
       writeIORef ffref g
       h <- readIORef xxref
       k (g <*> h) t
-    magicX cx xx w wi $ \g t -> do
+    magicX cx xx w wi es $ \g t -> do
       writeIORef xxref g
       h <- readIORef ffref
       k (h <*> g) t
   TrapX _ e -> case warp w of
-    Forward  -> magicE cx e w wi (\vs t -> k (const (last vs)) t)
+    Forward  -> magicE cx e w wi es (\vs t -> k (const (last vs)) t)
     Backward -> error "simulation doesn't support time reversal"
 {-
     Backward -> do
@@ -146,8 +162,8 @@ magicX cx arg w wi k = case arg of
           [] -> k (patch (const prim) vPrev (w t)) t
           (_,v):_ -> k (patch (const v) vPrev (w t)) t
 -}
-  TimeWarpX tmap tmapInv x -> magicX cx x (tmap . w) (wi . tmapInv) $ \g t -> do
-    k (g . tmap) t
+  TimeWarpX u ui x -> magicX cx x (u . w) (wi . ui) es $ \g t -> do
+    k (g . u) t
 
 patch :: (Time -> a) -> a -> Time -> (Time -> a)
 patch f v0 cutoff t | t == cutoff = v0
@@ -168,7 +184,7 @@ newMagicVar cx bias x w wi = do
       ref <- newIORef phase
       --modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
       modifyIORef (cxVisitedVars cx) ((uid, unsafeCoerce ref :: Any):)
-      let hookup = magicX cx x w wi (\g _ -> writeIORef ref g)
+      let hookup = magicX cx x w wi [] (\g _ -> writeIORef ref g)
       case bias of
         NowMinus -> addToList (cxDeferredHookups cx) hookup
         Now -> hookup
@@ -192,18 +208,19 @@ simulate :: (E a -> E b) -> IO a -> (Time -> b -> IO ()) -> IO ()
 simulate prog getIn doOut = do
   thisThreadId <- myThreadId
   epochMv <- newEmptyMVar
-  (deferIO, dispThread) <- newScheduler epochMv thisThreadId
+  ref4 <- newIORef []
+  (deferIO, dispThread) <- newScheduler epochMv thisThreadId ref4
   ref1 <- newIORef []
   ref2 <- newIORef []
   ref3 <- newIORef []
-  ref4 <- newIORef []
   genRef <- newIORef 0
   let cx = Context deferIO ref1 ref2 ref3 ref4 genRef
   inputHandlersRef <- newIORef []
-  let inE = InputE (\wi hd -> do addToList inputHandlersRef (hd,wi))
+  let inE = InputE
+            (\so es wi hd -> addToList inputHandlersRef (so,es,wi,hd))
   let e = prog inE
   loopCheckE e [] [] ["output"]
-  magicE cx e id id (\vs t -> mapM_ (doOut t) vs)
+  magicE cx e id id [] (\vs t -> mapM_ (doOut t) vs)
   repeatedlyExecuteDeferredHookups cx
   hds <- readIORef inputHandlersRef
   epoch <- getCurrentTime
@@ -211,12 +228,12 @@ simulate prog getIn doOut = do
   flip finally (killThread dispThread) $ forever $ do
     v <- getIn
     t <- getSimulationTime epoch
-    forM_ hds $ \(hd,wi) -> do
+    forM_ hds $ \(so,es,wi,hd) -> do
       let t' = wi t
       case compare t' t of
-        EQ -> hd v t
+        EQ -> hd [v] t -- this is wrong because its not synced with dispatch
         LT -> hPutStrLn stderr "Warning: acausal input ignored"
-        GT -> cxDeferIO cx [(t', hd v t')]
+        GT -> cxDeferIO cx [Trigger t' so es (hd [v] t')]
 
 
 repeatedlyExecuteDeferredHookups :: Context -> IO ()
@@ -357,73 +374,80 @@ loopCheckX arg jumps curs path = case arg of
 -- emitting an event containing the value at t- and the value at t+. More
 -- precisely, if events occuring at the same time would cause the signal to
 -- update more than once in the same t, only the initial value and the final
--- value will be reported in the event. And there will only be one event.
+-- value will be reported in the event. And there will only be one event at t.
 
-newDebounceId :: IORef Integer -> IO Integer
-newDebounceId ref = do
+newEdgeId :: IORef Int -> IO Int
+newEdgeId ref = do
   n <- readIORef ref
   modifyIORef ref succ
   return n
 
-registerDebounce :: IO () -> Integer -> IORef [(Integer, IO ())] -> IO ()
-registerDebounce action did ref = modifyIORef ref rdRec where
-  rdRec [] = [(did, action)]
-  rdRec ((did',io):dbs) | did' == did = (did,action) : dbs
-                        | otherwise = (did',io) : rdRec dbs
+deferFlush :: IORef [(Int, IO ())] -> Int -> IO () -> IO ()
+deferFlush ref flid action = modifyIORef ref deferRec where
+  deferRec [] = [(flid, action)]
+  deferRec ((flid',io):fls) | flid' == flid = (flid,action) : fls
+                            | otherwise = (flid',io) : deferRec fls
 
-executeDebounces :: IORef [(Integer, IO ())] -> IO ()
-executeDebounces ref = do
-  ios <- map snd <$> readIORef ref
-  sequence_ ios
-
-
-
+cxFlush :: Int -> IORef [(Int, IO ())] -> IO ()
+cxFlush i ref = do
+  (set1, set2) <- partition ((== i) . fst) <$> readIORef ref
+  writeIORef ref set2
+  case set1 of
+    [] -> return ()
+    [(_, io)] -> io
+    _ -> error "intermediate cxFlush invariant failed"
 
 -- The dispatcher is a thread which sleeps until one of the conditions:
 -- 1. a scheduled IO action must be executed
--- 2. an external agent wants something executed
+-- 2. an external agent wants something executed now
 
 newScheduler :: MVar UTCTime
              -> ThreadId
-             -> IO ([(Time, IO ())] -> IO (), ThreadId)
-newScheduler epochMv parentThread = do
+             -> IORef [(Int, IO ())]
+             -> IO ([Trigger] -> IO (), ThreadId)
+newScheduler epochMv parentThread flushRef = do
   --tv <- newTVarIO M.empty
   tv <- newTVarIO []
   wake <- newTChanIO
-  tid <- forkFinally (dispatcher epochMv tv wake) $ \ r -> case r of
+  tid <- forkFinally (dispatcher epochMv tv wake flushRef) $ \ r -> case r of
     Left e -> throwTo parentThread e
     Right _ -> return ()
   return (schedule tv wake, tid)
 
-schedule :: TVar [(Time, IO ())] -> TChan () -> [(Time, IO ())] -> IO ()
+schedule :: TVar [Trigger] -> TChan () -> [Trigger] -> IO ()
 schedule tv wake timeActions = do
   atomically $ do
     q <- readTVar tv
     --let q' = M.alter (insertAction action) target q
-    let q' = merge (comparing fst) q timeActions
+    let q' = merge (comparing trigTime) q timeActions
     writeTVar tv q'
     writeTChan wake ()
 
 
 dispatcher :: MVar UTCTime
-           -> TVar [(Time, IO ())]
+           -> TVar [Trigger]
            -> TChan ()
+           -> IORef [(Int, IO ())]
            -> IO ()
-dispatcher epochMv tv wake = do
+dispatcher epochMv tv wake flushRef = do
   epoch <- takeMVar epochMv
   forever $ do
     now <- getSimulationTime epoch
-    (nextWake, ios) <- atomically $ do
+    (nextWake, variousIO) <- atomically $ do
       q <- readTVar tv
-      let (lte, gt) = span ((<= now) . fst) q
+      let (lte, gt) = span ((<= now) . trigTime) q
       --let (lt, eq, gt) = M.splitLookup now q
       --let currents = fromMaybe [] eq
       writeTVar tv gt
       --return
         --( fmap (fst . fst) (M.minViewWithKey gt)
         --, concatMap snd (M.assocs lt) ++ currents )
-      return (fmap fst (listToMaybe gt), map snd lte)
-    sequence_ ios
+      return (fmap trigTime (listToMaybe gt), lte)
+    forM_ (groupBy (on (==) trigTime) variousIO) $ \sameTimeIOs -> do
+      mapM trigIO sameTimeIOs
+      testIs <- map fst <$> readIORef flushRef
+      forM_ testIs (\i -> cxFlush i flushRef)
+      -- fix this shit
     case nextWake of
       Nothing -> atomically (readTChan wake)
       Just tNext -> do
@@ -458,3 +482,21 @@ getSimulationTime epoch = do
   let t = diffUTCTime now epoch
   return (realToFrac t)
 
+
+
+data Trigger = Trigger
+  { trigTime :: Time
+  , trigOrd :: Int
+  , trigEdges :: [Int]
+  , trigIO :: IO () }
+
+instance Show Trigger where
+  show (Trigger a b c _) = unwords ["Trigger", show a, show b, show c, "_"]
+
+
+takeSrcOrd :: Context -> IO Int
+takeSrcOrd cx = do
+  let ref = cxGenerator cx
+  n <- readIORef ref
+  writeIORef ref (n+1)
+  return n

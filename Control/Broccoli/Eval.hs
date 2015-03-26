@@ -25,7 +25,7 @@ data E a where
   DelayE :: E (a, Double) -> E a
   SnapshotE :: forall a b c . Bias -> (c -> b -> a) -> X c -> E b -> E a
   EdgeE :: forall a b . a ~ (b,b) => X b -> E a
-  InputE :: ((Time -> Time) -> (a -> Time -> IO ()) -> IO ()) -> E a
+  InputE :: InHook a -> E a
   DebugE :: (a -> String) -> E a -> E a
 
 -- | @X a@ represents time signals with values of type @a@.
@@ -43,6 +43,8 @@ type Time = Double
 type Handler a = a -> Time -> IO ()
 
 data Bias = Now | NowMinus deriving (Eq, Ord, Show, Read)
+
+type InHook a = Int -> [Int] -> (Time -> Time) -> ([a] -> Time -> IO ()) -> IO ()
 
 toggleBias :: Bias -> Bias
 toggleBias Now = NowMinus
@@ -99,6 +101,14 @@ trap = TrapX
 
 justE :: E (Maybe a) -> E a
 justE = JustE
+
+-- | Like 'delayE' but the amount of delay is determined on a per-event basis.
+delayE' :: E (a, Double) -> E a
+delayE' = DelayE
+
+-- | Delay occurrences of an event.
+delayE :: Double -> E a -> E a
+delayE dt e = delayE' (fmap (,dt) e)
 
 
 -- | Shift a signal forward in time. A negative shift shifts back in time.
@@ -226,14 +236,15 @@ rezip :: (Time -> a) -> [(Time, Time -> a)] -> [(Time -> a, Time)]
 rezip _ [] = []
 rezip ph0 ((t1,ph1):phs) = (ph0,t1) : rezip ph1 phs
 
-{-
 w t = 10 - t/2
 wi t = 20 - 2*t
 e1 = occurs [(2, (1)), (4, (7)), (6, (5))]
---e2 = occurs [(3, 0), (4, 1), (5, 2)]
 e2 = occurs [(3, 0), (4, 1), (4, 2), (5, 10)]
 x3 = (liftA2 (+) (trap (-1) e1) (trap (-1) e2))
--}
+e4 = edge x3
+e5 = e4 <> occurs [(2.5, q 90), (4, q 40), (10,q 0), (10, q 2), (11, q 9)]
+e6 = e4 <> delayE 1 (occurs [(3, q 40)])
+q x = (x,x)
 
 delay :: (Time, (a, Double)) -> (Time, a)
 delay (t, (x, dt)) = (t + dt, x)
