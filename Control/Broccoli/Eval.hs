@@ -142,7 +142,6 @@ edge x = if containsTimeX x
   else EdgeE x
 
 
-
 at :: X a -> Time -> a
 at x t = case nextTimeX x of
   Nothing -> phaseX x t
@@ -161,7 +160,7 @@ headE arg = case arg of
   ConstantE [] -> error "headE []"
   ConstantE ((t,v):os) -> (v, ConstantE os)
   FmapE f e -> let (v,e') = headE e in (f v, FmapE f e')
-  JustE e -> error "just"
+  JustE e -> let (v, e') = headJustE e in (v, JustE e')
   UnionE e1 e2 ->
     let mt1 = nextTimeE e1 in
     let mt2 = nextTimeE e2 in
@@ -231,6 +230,34 @@ nextTimeX arg = case arg of
   TrapX v e -> nextTimeE e
   TimeWarpX _ wi x -> fmap wi (nextTimeX x)
 
+-- find next occurrence time if any
+nextTimeE :: E a -> Maybe Time
+nextTimeE arg = case arg of
+  ConstantE [] -> Nothing
+  ConstantE ((t,v):_) -> Just t
+  FmapE _ e -> nextTimeE e
+  JustE e -> nextJust e
+  UnionE e1 e2 -> case catMaybes [nextTimeE e1, nextTimeE e2] of
+    [] -> Nothing
+    ts -> Just (minimum ts)
+  DelayE _ delta e -> fmap (+delta) (nextTimeE e)
+  SnapshotE _ _ _ _ e -> nextTimeE e
+  EdgeE x -> nextTimeX x
+  InputE _ -> Nothing
+  DebugE _ e -> nextTimeE e
+
+nextJust :: E (Maybe a) -> Maybe Time
+nextJust e = case nextTimeE e of
+  Nothing -> Nothing
+  Just t -> case headE e of
+    (Just v, e') -> Just t
+    (Nothing, e') -> nextJust e'
+
+headJustE :: E (Maybe a) -> (a, E (Maybe a))
+headJustE e = case headE e of
+  (Just v, e') -> (v, e')
+  (Nothing, e') -> headJustE e'
+
 -- a trap takes the last of a series of occurrences happening at the same time
 lastO :: E a -> Time -> (a, E a)
 lastO e t =
@@ -260,22 +287,6 @@ shE arg = case arg of
   EdgeE x -> "Edge"
   InputE _ -> "Input"
   DebugE _ e -> "Debug"
-
--- find next occurrence time if any
-nextTimeE :: E a -> Maybe Time
-nextTimeE arg = case arg of
-  ConstantE [] -> Nothing
-  ConstantE ((t,v):_) -> Just t
-  FmapE _ e -> nextTimeE e
-  JustE e -> nextTimeE e -- hmm..
-  UnionE e1 e2 -> case catMaybes [nextTimeE e1, nextTimeE e2] of
-    [] -> Nothing
-    ts -> Just (minimum ts)
-  DelayE _ delta e -> fmap (+delta) (nextTimeE e)
-  SnapshotE _ _ _ _ e -> nextTimeE e
-  EdgeE x -> nextTimeX x
-  InputE _ -> Nothing
-  DebugE _ e -> nextTimeE e
 
 timeOnlyX :: X a -> Bool
 timeOnlyX arg = case arg of
@@ -316,6 +327,7 @@ e4 = edge x3
 e5 = e4 <> occurs [(2.5, q 90), (4, q 40), (10,q 0), (10, q 2), (11, q 9)]
 e6 = e4 <> delayE 1 (occurs [(3, q 40)])
 q x = (x,x)
+e7 = edge (timeWarp w wi x3)
 
 counter :: E () -> X Int
 counter bump = out where
