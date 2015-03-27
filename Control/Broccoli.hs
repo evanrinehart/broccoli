@@ -33,7 +33,6 @@ module Control.Broccoli (
   dilate,
   timeShift,
   timeWarp,
-  delayE',
   noise,
   snapshot_,
   snapshot',

@@ -8,18 +8,6 @@ import Numeric
 import Control.Broccoli.Eval
 
 
-counter :: E () -> X Int
-counter bump = out where
-  out = trap 0 e2
-  e2 = snapshot_ next bump
-  next = (+1) <$> out
-
-counter' :: E () -> X Int
-counter' bump = out where
-  out = trap 0 e2
-  e2 = snapshot_ next bump
-  next = (+1) <$> (counter' bump)
-
 maybeE :: (a -> Maybe b) -> E a -> E b
 maybeE f e = justE (fmap f e)
 
@@ -32,19 +20,10 @@ voidE e = () <$ e
 eitherE :: E a -> E b -> E (Either a b)
 eitherE e1 e2 = (Left <$> e1) <> (Right <$> e2)
 
--- | When the event occurs the value of the signal immediately before that
--- time will be captured. Therefore the output can feed back into the input.
-snapshot :: (a -> b -> c) -> X a -> E b -> E c
-snapshot = SnapshotE NowMinus
-
 -- | Like 'snapshot' but ignores the original event's payload.
 snapshot_ :: X a -> E b -> E a
 snapshot_ = snapshot const
 
--- | Like 'snapshot' but captures the value 'at' the time of the event.
--- Therefore the input cannot depend on the output.
-snapshot' :: (a -> b -> c) -> X a -> E b -> E c
-snapshot' = SnapshotE Now
 
 -- | Slow down a signal by a factor. A factor less than one is a speed-up.
 dilate :: Double -> X a -> X a

@@ -5,15 +5,17 @@ module Control.Broccoli.Eval where
 
 import Control.Applicative
 import Data.List
-import Data.Function
 import Data.Ord
 import Data.Monoid
 import Data.Maybe
-import Data.Traversable
 import Control.Comonad
 import Test.QuickCheck
 import Test.QuickCheck.Function
+import Data.Map (Map)
+import qualified Data.Map as M
+
 import Debug.Trace
+import Unsafe.Coerce
 
 -- | @E a@ represents events with values of type @a@.
 -- 
@@ -24,7 +26,7 @@ data E a where
   JustE :: E (Maybe a) -> E a
   UnionE :: E a -> E a -> E a
   DelayE :: Integer -> Double -> E a -> E a
-  SnapshotE :: forall a b c . Bias -> (c -> b -> a) -> X c -> E b -> E a
+  SnapshotE :: forall a b c . Integer -> Bias -> (c -> b -> a) -> X c -> E b -> E a
   EdgeE :: forall a b . a ~ (b,b) => X b -> E a
   InputE :: InHook a -> E a
   DebugE :: (a -> String) -> E a -> E a
@@ -102,13 +104,9 @@ trap = TrapX
 justE :: E (Maybe a) -> E a
 justE = JustE
 
--- | Like 'delayE' but the amount of delay is determined on a per-event basis.
-delayE' :: E (a, Double) -> E a
-delayE' = DelayE
-
 -- | Delay occurrences of an event.
 delayE :: Double -> E a -> E a
-delayE dt e = delayE' (fmap (,dt) e)
+delayE dt e = DelayE 0 dt e 
 
 
 -- | Shift a signal forward in time. A negative shift shifts back in time.
@@ -126,12 +124,158 @@ timeWarp' f x = if timeOnlyX x
   then timeWarp f undefined x
   else error "timeWarp': can't handle events. Try regular timeWarp."
 
+-- | When the event occurs the value of the signal immediately before that
+-- time will be captured. Therefore the output can feed back into the input.
+snapshot :: (a -> b -> c) -> X a -> E b -> E c
+snapshot = SnapshotE 0 NowMinus
+
+-- | Like 'snapshot' but captures the value 'at' the time of the event.
+-- Therefore the input cannot depend on the output.
+snapshot' :: (a -> b -> c) -> X a -> E b -> E c
+snapshot' = SnapshotE 0 Now
+
 -- | Event occurs on transitions in a piecewise constant signal. Doesn't
 -- work on continuously varying signals.
 edge :: X a -> E (a, a)
 edge x = if containsTimeX x
   then error "edge: input not piecewise constant"
   else EdgeE x
+
+
+
+at :: X a -> Time -> a
+at x t = case nextTimeX x of
+  Nothing -> phaseX x t
+  Just t' -> if t < t'
+    then phaseX x t
+    else let foo = tailX x in foo `at` t
+
+occs :: E a -> [(Time, a)]
+occs e = case nextTimeE e of
+  Nothing -> []
+  Just t -> let (v,e') = headE e in (t, v) : occs e'
+
+-- divide a non-never event into first and rest occurrences
+headE :: E a -> (a, E a)
+headE arg = case arg of
+  ConstantE [] -> error "headE []"
+  ConstantE ((t,v):os) -> (v, ConstantE os)
+  FmapE f e -> let (v,e') = headE e in (f v, FmapE f e')
+  JustE e -> error "just"
+  UnionE e1 e2 ->
+    let mt1 = nextTimeE e1 in
+    let mt2 = nextTimeE e2 in
+    if mLTE mt1 mt2
+      then let (v,e') = headE e1 in (v, UnionE e' e2)
+      else let (v,e') = headE e2 in (v, UnionE e1 e')
+  DelayE _ delta e -> headE e
+  SnapshotE name bias cons x e -> ans where
+    (v2,e') = headE e
+    Just t = nextTimeE e
+    v1 = case nextTimeX x of
+      Nothing -> phaseX x t
+      Just t' -> if t <= t' then phaseX x t else error "fuck"
+    x' = case nextTimeX x of
+      Nothing -> x
+      Just t' -> if t < t' then x else tailX x
+    v = cons v1 v2
+    ans = (v, SnapshotE name bias cons x' e')
+  EdgeE x -> case nextTimeX x of
+    Nothing -> error "headE nonsense 1"
+    Just t -> ((ph t, ph' t), EdgeE (tailX x)) where
+      ph = phaseX x
+      ph' = phaseX (tailX x)
+  InputE _ -> error "headE input"
+  DebugE _ e -> headE e
+
+-- drop the current phase and replace with next phase, unless that is nonsense
+tailX :: X a -> X a
+tailX arg = case arg of
+  PureX v -> error "tailX pure"
+  TimeX -> error "tailX time"
+  FmapX f x -> FmapX f (tailX x)
+  ApplX ff xx -> case nextTimeX ff of
+    Nothing -> case nextTimeX xx of
+      Nothing -> error "tailX nonsense 1"
+      Just _ -> ApplX ff (tailX xx)
+    Just t1 -> case nextTimeX xx of
+      Nothing -> ApplX (tailX ff) xx
+      Just t2 -> case compare t1 t2 of
+        LT -> ApplX (tailX ff) xx
+        GT -> ApplX ff (tailX xx)
+        EQ -> ApplX (tailX ff) (tailX xx)
+  TrapX v e -> case nextTimeE e of
+    Nothing -> error "tailX nonsense 2"
+    Just t -> let (v', e') = lastO e t in TrapX v' e'
+  TimeWarpX w wi x -> TimeWarpX w wi (tailX x)
+
+-- the "current phase" of a signal
+phaseX :: X a -> Time -> a
+phaseX arg t = case arg of
+  PureX v -> v
+  TimeX -> t
+  FmapX f x -> f (phaseX x t)
+  ApplX ff xx -> (phaseX ff t) (phaseX xx t)
+  TrapX v e -> v
+  TimeWarpX w _ x -> phaseX x (w t)
+
+-- find next transition time if any
+nextTimeX :: X a -> Maybe Time
+nextTimeX arg = case arg of
+  PureX v -> Nothing
+  TimeX -> Nothing
+  FmapX _ x -> nextTimeX x
+  ApplX ff xx -> case catMaybes [nextTimeX ff, nextTimeX xx] of
+    [] -> Nothing
+    ts -> Just (minimum ts)
+  TrapX v e -> nextTimeE e
+  TimeWarpX _ wi x -> fmap wi (nextTimeX x)
+
+-- a trap takes the last of a series of occurrences happening at the same time
+lastO :: E a -> Time -> (a, E a)
+lastO e t =
+  let (v,e') = headE e in
+  case nextTimeE e' of
+    Nothing -> (v,e')
+    Just t' | t' == t -> lastO e' t
+            | otherwise -> (v,e')
+
+shX :: X a -> String
+shX arg = case arg of
+  PureX _ -> "Pure"
+  TimeX -> "Time"
+  FmapX _ x -> "Fmap"
+  ApplX _ _ -> "Appl"
+  TrapX _ _ -> "Trap"
+  TimeWarpX _ _ _ -> "Warp"
+
+shE :: E a -> String
+shE arg = case arg of
+  ConstantE _ -> "Constant"
+  FmapE _ e -> "FmapE"
+  JustE e -> "Just"
+  UnionE e1 e2 -> "Union"
+  DelayE _ delta e -> "Delay"
+  SnapshotE _ _ _ _ e -> "Snap"
+  EdgeE x -> "Edge"
+  InputE _ -> "Input"
+  DebugE _ e -> "Debug"
+
+-- find next occurrence time if any
+nextTimeE :: E a -> Maybe Time
+nextTimeE arg = case arg of
+  ConstantE [] -> Nothing
+  ConstantE ((t,v):_) -> Just t
+  FmapE _ e -> nextTimeE e
+  JustE e -> nextTimeE e -- hmm..
+  UnionE e1 e2 -> case catMaybes [nextTimeE e1, nextTimeE e2] of
+    [] -> Nothing
+    ts -> Just (minimum ts)
+  DelayE _ delta e -> fmap (+delta) (nextTimeE e)
+  SnapshotE _ _ _ _ e -> nextTimeE e
+  EdgeE x -> nextTimeX x
+  InputE _ -> Nothing
+  DebugE _ e -> nextTimeE e
 
 timeOnlyX :: X a -> Bool
 timeOnlyX arg = case arg of
@@ -151,192 +295,18 @@ containsTimeX arg = case arg of
   TrapX _ _ -> False
   TimeWarpX _ _ x -> containsTimeX x
 
--- | Measure the value of a signal at some time.
-at :: X a -> Time -> a
-at arg t = case arg of
-  PureX v -> v
-  TimeX -> t
-  FmapX f x -> f (x `at` t)
-  ApplX ff xx -> (ff `at` t) (xx `at` t)
-  TrapX prim e -> case (trace "occZMSearch" (occZMSearch (occs e) t)) of
-    Nothing -> prim
-    Just (_,x) -> x
-  TimeWarpX g _ x -> x `at` (g t)
+mLTE :: Ord a => Maybe a -> Maybe a -> Bool
+mLTE (Just a) (Just b) = a <= b
+mLTE (Just _) Nothing = True
+mLTE Nothing (Just _) = False
+mLTE Nothing Nothing = error "mLTE nonsense"
 
--- | List of all the occurrences of an event.
-occs :: E a -> [(Time, a)]
-occs arg = case arg of
-  ConstantE os -> os
-  FmapE f e -> map (fmap f) (occs e)
-  JustE e -> (catMaybes . map sequenceA) (occs e)
-  UnionE e1 e2 -> merge (comparing fst) (occs e1) (occs e2)
-  DelayE e -> sortBy (comparing fst) (map delay (occs e))
-  SnapshotE bias cons x e -> evalSnapshot bias cons ph0 phs (trace "occs e" (occs e)) where
-    (ph0, phs) = allPhases x
-  EdgeE x -> allTrans x
-  InputE _ -> []
-  DebugE _ e -> occs e
-
-evalSnapshot :: Bias
-             -> (a -> b -> c)
-             -> (Time -> a)
-             -> [(Time, Time -> a)]
-             -> [(Time, b)]
-             -> [(Time, c)]
-evalSnapshot _    _    _   _                 []             = []
-evalSnapshot bias cons ph  []                ((t,v):os)     =
-  (t, cons (ph t) v) : evalSnapshot bias cons ph [] os
-evalSnapshot bias cons ph0 l1@((t1,ph1):phs) l2@((t2,v):os) =
-  case compare t1 t2 of
-    LT -> evalSnapshot bias cons ph1 phs l2
-    GT -> (t2, cons (ph0 t2) v) : evalSnapshot bias cons ph0 l1 os
-    EQ -> case bias of
-      Now -> (t2, cons (ph1 t2) v) : evalSnapshot bias cons ph0 l1 os
-      NowMinus -> (t2, cons (ph0 t1) v) : evalSnapshot bias cons ph0 l1 os
-
-occs :: E a -> [(Time, a)]
-occs e = case takeOcc [] e of
-  (Nothing, _) -> []
-  (Just o, e') -> o : occs e'
-
-takeOcc :: [Integer] -> E a -> (Maybe (Time, a), E a)
-takeOcc dn arg = case arg of
-  ConstantE [] -> (Nothing, never)
-  ConstantE (o:os) -> (Just o, ConstantE os)
-  FmapE f e -> let (mo,e') = takeOcc dn e in (fmap f mo, FmapE f e')
-  UnionE e1 e2 -> case takeOcc dn e1 of
-    (Nothing, _) -> case takeOcc dn e2 of
-      (Nothing, _) -> (Nothing, never)
-      (Just o, e2') -> (Just o, UnionE e1 e2')
-    (Just o1@(t1,_), e1') -> case takeOcc dn e2 of
-      (Nothing, _) -> (Just o1, UnionE e1' e2)
-      (Just o2@(t2,_), e2') -> case compare t1 t2 of
-        LT -> (Just o1, UnionE e1' e2 )
-        GT -> (Just o2, UnionE e1  e2')
-        EQ -> (Just o1, UnionE e1' e2 )
-  DelayE name delta e -> if name `elem` dn
-    then (Nothing, never)
-    else case takeOcc (name:dn) e of
-      (Nothing, _) -> (Nothing, never)
-      (Just (t,v), e') -> (Just (t+delta, v), DelayE name delta e')
-  SnapshotE bias cons x e -> case takeOcc dn e of
-    (Nothing, _) -> (Nothing, never)
-    (Just (t,v), e') -> takeSnap dn bias cons t v x e'
-  EdgeE x -> case takePhase dn x of
-    (_, Nothing) -> (Nothing, never)
-    (ph, Just (t, x')) -> case takePhase dn x' of
-      (ph', _) -> (Just (t, (ph t, ph' t)), Edge x')
-  InputE _ -> (Nothing, never)
-  DebugE _ e -> takeOcc e
-
-takeSnap :: [Integer] -> Bias -> (a -> b -> c) -> Time -> b
-         -> X a -> E b -> (Maybe (Time,c), E c)
-takeSnap dn bias cons t v1 x e' = case takePhase dn x of
-  (ph, Nothing) ->
-    let v2 = ph t in (Just (t, cons v1 v2), SnapshotE bias cons x e')
-  (ph, Just (t', x')) -> case compare t t' of
-    LT -> let v2 = ph t in (Just (t, cons v1 v2), SnapshotE bias cons x e')
-    GT -> takeSnap dn bias cons t x' e'
-    EQ -> case bias of
-      Now -> takeSnap dn bias cons t x' e'
-      NowMinus -> 
-        let v2 = ph t in (Just (t, cons v1 v2), SnapshotE bias cons x e')
-
-takePhase :: [Integer] -> X a -> (Time -> a, Maybe (Time, X a))
-takePhase arg = case arg of
-  PureX v -> (const v, Nothing)
-  TimeX -> (id, Nothing)
-  FmapX f x ->
-    let (ph,mph) = takePhase dn x in (f . ph, (fmap . fmap) (FmapX f) mph)
-  ApplX ff xx -> case takePhase dn ff of
-    (f, Nothing) -> case takePhase dn xx of
-      (x, Nothing)        -> (f <*> x, Nothing)
-      (x, Just (t , xx')) -> (f <*> x, Just (t, ApplX ff xx'))
-    (f, Just (t1, ff')) -> case takePhase dn xx of
-      (x, Nothing)        -> (f <*> x, Just (t1, ApplX ff' xx))
-      (x, Just (t2, xx')) -> case compare t1 t2 of
-        LT -> (f <*> x, Just (t1, ApplX ff' xx ))
-        GT -> (f <*> x, Just (t2, ApplX ff  xx'))
-        LT -> (f <*> x, Just (t1, ApplX ff' xx'))
-  TrapX v e -> case takeOcc dn e of
-    (Nothing, _)      -> (const v, Nothing)
-    (Just (t,v'), e') -> (const v, Just (t, Trap v' e'))
-  TimeWarpX w wi x ->
-    let (ph,mph) = takePhase dn x in (ph . w, (fmap . fmap) (TimeWarp w wi) mph)
-
-at :: X a -> Time -> a
-at x t = case takePhase x of
-  (ph, Nothing) -> ph t
-  (ph, Just (t', x')) -> if t < t'
-    then ph t
-    else at x' t
-
-{-
-counter :: E () -> X Int
-counter bump = out where
-  out = trap 0 e2
-  e2 = snapshot_ next bump
-  next = (+1) <$> out
--}
-
--- the "current" answer to a trap value question can be answered by providing
--- the most recent occurrence (or nothing if there wasnt one yet)
---
--- the current answer to a snapshot question can be answered by providing the
--- phase at the current time (minus)
---
--- edge is like trap in reverse, provide the most recent transition.
-
--- in order build an occurrence history fowards, we can pass a concat endo
--- thing along to attach the answer to.
-
-allPhases :: X a -> (Time -> a, [(Time, Time -> a)])
-allPhases arg = case arg of
-  PureX v -> (const v, [])
-  TimeX -> (id, [])
-  FmapX f x -> let (ph0, phs) = allPhases x in
-    (f . ph0, map (\(t, ph) -> (t, f . ph)) phs)
-  ApplX ff xx -> allApplPhases ff xx
-  --TrapX prim e -> (const prim, map f . groupBy (on (==) fst) . occs $ e) where
-  TrapX prim e -> (const prim, map f . gg . occs $ e) where
-    f os = let (t, v) = last os in (t, const v)
-  TimeWarpX w wi x -> case warp w of
-    Forward -> let (ph0, phs) = allPhases x in
-      (ph0 . w, map (\(t,ph) -> (wi t, ph . w)) phs)
-    Backward -> case allPhases x of
-      (ph0, []) -> (ph0 . w, [])
-      (ph0, phs) ->
-        let phs' = reverse (rezip ph0 phs) in
-        let (_,final) = last phs in
-        (final . w, map (\(ph, t) -> (wi t, ph . w))  phs')
-
-gg :: [a] -> [[a]]
-gg [] = []
-gg (x:xs) = [x]:gg xs
-
-allTrans :: X a -> [(Time, (a,a))]
-allTrans arg = zipWith f ((undefined,ph0):phs) phs where
-  (ph0, phs) = allPhases arg
-  f (_,ph0') (t,ph1) = (t, (ph0' t, ph1 t))
-
-allApplPhases :: X (a -> b) -> X a -> (Time -> b, [(Time, Time -> b)])
-allApplPhases ff xx = ans where
-  (f0,fphs) = allPhases ff
-  (x0,xphs) = allPhases xx
-  y0 = f0 <*> x0
-  ans = (y0, k f0 x0 fphs xphs)
-  k _ _ [] [] = []
-  k f _ [] ((t, x'):xs) = (t, f <*> x') : k f x' [] xs
-  k _ x ((t, f'):fs) [] = (t, f' <*> x) : k f' x fs []
-  k f x l1@((t1, f'):fs) l2@((t2,x'):xs) = case compare t1 t2 of
-    EQ -> (t1, f' <*> x') : k f' x' fs xs
-    LT -> (t1, f' <*> x ) : k f' x fs l2
-    GT -> (t2, f  <*> x') : k f x' l1 xs
 
 rezip :: (Time -> a) -> [(Time, Time -> a)] -> [(Time -> a, Time)]
 rezip _ [] = []
 rezip ph0 ((t1,ph1):phs) = (ph0,t1) : rezip ph1 phs
 
+-- experiments
 w t = 10 - t/2
 wi t = 20 - 2*t
 e1 = occurs [(2, (1)), (4, (7)), (6, (5))]
@@ -347,21 +317,18 @@ e5 = e4 <> occurs [(2.5, q 90), (4, q 40), (10,q 0), (10, q 2), (11, q 9)]
 e6 = e4 <> delayE 1 (occurs [(3, q 40)])
 q x = (x,x)
 
-delay :: (Time, (a, Double)) -> (Time, a)
-delay (t, (x, dt)) = (t + dt, x)
+counter :: E () -> X Int
+counter bump = out where
+  out = trap 0 e2
+  e2 = SnapshotE 0 NowMinus const next bump
+  next = (+1) <$> out
 
-occZMSearch :: [(Time, a)] -> Time -> Maybe (Time, a)
-occZMSearch hay t = case span (\(t',_) -> t' <= t) hay of
-  ([], _) -> Nothing
-  (os, _) -> Just (last os)
-
-phaseMinusSearch :: (Time -> a) -> [(Time, Time -> a)] -> Time -> (Time -> a)
-phaseMinusSearch ph0 hay t = case span (\(t',_) -> t' < t) hay of
-  ([], _) -> ph0
-  (phs, _) -> let (_,ph) = last phs in ph
-
-primPhase :: X a -> (Time -> a)
-primPhase x = fst (allPhases x)
+counter' :: E () -> X Int
+counter' bump = out where
+  out = trap 0 e2
+  e2 = SnapshotE 0 NowMinus const next bump
+  next = (+1) <$> out
+------
 
 
 -- merge two sorted lists into another sorted list lazily
@@ -412,29 +379,29 @@ prop_delayE delta e = all id (zipWith f (occs e) (occs e')) where
 -}
 
 prop_snapshot1 :: Eq a => X a -> E a -> Bool
-prop_snapshot1 x e = occs (SnapshotE Now (,) x e) == fmap f (occs e) where
+prop_snapshot1 x e = occs (SnapshotE 0 Now (,) x e) == fmap f (occs e) where
   f (t, v) = (t, (x `at` t, v))
 
 prop_snapshot2 :: Bool
-prop_snapshot2 = occs (SnapshotE Now (,) x e) == fmap f (occs e) where
+prop_snapshot2 = occs (SnapshotE 0 Now (,) x e) == fmap f (occs e) where
   e = occurs [(0, 'a'), (1, 'b'), (2, 'c')]
   x = TrapX 'z' (occurs [(0,'d'), (1,'e'), (2,'f')])
   f (t, v) = (t, (x `at` t, v))
 
 prop_snapshot3 :: Bool
-prop_snapshot3 = occs (SnapshotE NowMinus (,) x e) == ans where
+prop_snapshot3 = occs (SnapshotE 0 NowMinus (,) x e) == ans where
   e = occurs [(0, 'a'), (1, 'b'), (2, 'c')]
   x = TrapX 'z' (occurs [(0,'d'), (1,'e'), (2,'f')])
   ans = [(0, ('z','a')), (1, ('d','b')), (2, ('e','c'))]
 
 prop_snapshot4 :: Bool
-prop_snapshot4 = occs (SnapshotE Now (,) x e) == ans where
+prop_snapshot4 = occs (SnapshotE 0 Now (,) x e) == ans where
   e = occurs [(-1, 'a'), (0, 'b'), (1, 'c')]
   x = TimeWarpX negate negate (TrapX 'z' (occurs [(-1,'d'), (0,'e'), (1,'f')]))
   ans = [(-1, ('f','a')), (0, ('e','b')), (1, ('d','c'))]
 
 prop_snapshot5 :: Bool
-prop_snapshot5 = occs (SnapshotE NowMinus (,) x e) == ans where
+prop_snapshot5 = occs (SnapshotE 0 NowMinus (,) x e) == ans where
   e = occurs [(-1, 'a'), (0, 'b'), (1, 'c')]
   x = TimeWarpX negate negate (TrapX 'z' (occurs [(-1,'d'), (0,'e'), (1,'f')]))
   ans = [(-1, ('z','a')), (0, ('f','b')), (1, ('e','c'))]
@@ -489,3 +456,25 @@ trapGen = do
   e <- arbitrary
   v0 <- arbitrary
   return (TrapX v0 e)
+
+
+
+data Progress = Progress
+  { prDelayNames :: [Integer]
+  , prSnapEvents :: (Map Integer (E Any)) }
+
+prAddDN :: Progress -> Integer -> Progress
+prAddDN pr i = pr { prDelayNames = i : prDelayNames pr }
+
+prAddSnapEvent :: Progress -> Integer -> E a -> Progress
+prAddSnapEvent pr name e = pr { prSnapEvents = f (prSnapEvents pr) } where
+  f m = M.insert name (unsafeCoerce e) m
+
+-- not type safe but it isn't visible to the client
+prLookupEvent :: Progress -> Integer -> E a -> E a
+prLookupEvent pr name eDef = case M.lookup name (prSnapEvents pr) of
+  Nothing -> eDef
+  Just e -> (unsafeCoerce e)
+
+prEmpty :: Progress
+prEmpty = Progress [] M.empty

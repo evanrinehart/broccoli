@@ -68,8 +68,9 @@ magicE cx e0 w wi es k = case e0 of
   UnionE e1 e2 -> do
     magicE cx e1 w wi es k
     magicE cx e2 w wi es k
-  DelayE e -> addToList (cxDeferredHookups cx) (magicDelayE cx e w wi es k)
-  SnapshotE bias cons x e -> do
+  DelayE _ delta e ->
+    addToList (cxDeferredHookups cx) (magicDelayE cx delta e w wi es k)
+  SnapshotE _ bias cons x e -> do
     ref <- newMagicVar cx bias x w wi
     magicE cx e w wi es $ \vs t -> do
       g <- readIORef ref
@@ -78,7 +79,7 @@ magicE cx e0 w wi es k = case e0 of
     srcOrd <- takeSrcOrd cx
     hookup srcOrd es wi k
   EdgeE x -> do
-    let g0 = primPhase x
+    let g0 = phaseX x
     ref <- newIORef g0
     edgeId <- newEdgeId (cxGenerator cx)
     magicX cx x w wi (edgeId:es) $ \g' t -> do
@@ -101,19 +102,20 @@ magicE cx e0 w wi es k = case e0 of
         magicE cx e w wi es (\vs t -> k vs t)
 
 magicDelayE :: Context
-            -> E (a, Double)
+            -> Double
+            -> E a
             -> (Time -> Time)
             -> (Time -> Time)
             -> EdgeSet
             -> ([a] -> Time -> IO ())
             -> IO ()
-magicDelayE cx e w wi es k = do
+magicDelayE cx delta e w wi es k = do
   srcOrd <- takeSrcOrd cx
   magicE cx e w wi [] $ \delayVs t -> do
     -- groups :: [[(Time, a)]]
     let groups = groupBy (on (==) fst)
                . sortBy (comparing fst)
-               . map (\(v, dt) -> (t + dt, v))
+               . map (\v -> (t + delta, v))
                $ delayVs
     forM_ groups $ \chunk -> do -- vs :: [(Time, a)]
       let t' = fst (head chunk)
@@ -132,8 +134,8 @@ magicX cx arg w wi es k = case arg of
   TimeX -> return ()
   FmapX f x -> magicX cx x w wi es (\g t -> k (f . g) t)
   ApplX ff xx -> do
-    let f0 = primPhase ff
-    let x0 = primPhase xx
+    let f0 = phaseX ff
+    let x0 = phaseX xx
     ffref <- newIORef f0
     xxref <- newIORef x0
     magicX cx ff w wi es $ \g t -> do
@@ -180,7 +182,7 @@ newMagicVar cx bias x w wi = do
   saw <- readIORef (cxVisitedVars cx)
   case lookup uid saw of
     Nothing -> do
-      let phase = primPhase x
+      let phase = phaseX x
       ref <- newIORef phase
       --modifyIORef (cxVisitedVars cx) (M.insert uid (unsafeCoerce ref :: Any))
       modifyIORef (cxVisitedVars cx) ((uid, unsafeCoerce ref :: Any):)
@@ -313,7 +315,7 @@ loopCheckE arg jumps curs path = case arg of
     when (i `elem` curs) (crap path')
     loopCheckE e1 jumps (i:curs) path'
     loopCheckE e2 jumps (i:curs) path'
-  DelayE e -> do
+  DelayE _ _ e -> do
     i <- getNodeNameE arg
     let path' = ("delayE("++show i++")") : path
     when (i `elem` curs) (crap path')
@@ -321,7 +323,7 @@ loopCheckE arg jumps curs path = case arg of
     if j `elem` jumps
       then return ()
       else loopCheckE e (j:jumps) [] path'
-  SnapshotE _ _ x e -> do
+  SnapshotE _ _ _ x e -> do
     i <- getNodeNameE arg
     let path' = ("snapshot("++show i++")") : path
     when (i `elem` curs) (crap path')
