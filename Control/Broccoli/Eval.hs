@@ -167,7 +167,7 @@ headE arg = case arg of
     if mLTE mt1 mt2
       then let (v,e') = headE e1 in (v, UnionE e' e2)
       else let (v,e') = headE e2 in (v, UnionE e1 e')
-  DelayE _ delta e -> headE e
+  DelayE name delta e -> let (v,e') = headE e in (v, DelayE name delta e')
   SnapshotE name bias cons x e -> ans where
     (v2,e') = headE e
     Just t = nextTimeE e
@@ -328,6 +328,7 @@ e5 = e4 <> occurs [(2.5, q 90), (4, q 40), (10,q 0), (10, q 2), (11, q 9)]
 e6 = e4 <> delayE 1 (occurs [(3, q 40)])
 q x = (x,x)
 e7 = edge (timeWarp w wi x3)
+e8 = delayE 5 (occurs [(0, ())] <> e8)
 
 counter :: E () -> X Int
 counter bump = out where
